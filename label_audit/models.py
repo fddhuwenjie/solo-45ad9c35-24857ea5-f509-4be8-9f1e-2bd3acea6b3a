@@ -227,3 +227,45 @@ class PrintBatchDispose(BaseModel):
     action: Literal["scrap", "quarantine"]
     quantity: int = Field(gt=0, description="处置数量，不得超过剩余数量")
     reason: str = Field(min_length=1)
+
+
+# ------------------------------------------------------------- 投料谱系
+class MaterialLotCreate(BaseModel):
+    """原料到货批号：同一原料的不同批号可分别采用不同规格版本。"""
+
+    lot_id: str = Field(min_length=1)
+    ingredient_id: str = Field(min_length=1)
+    supplier_lot_no: str = Field(min_length=1, description="供应商批号；同一原料下唯一")
+    spec_version: str = Field(min_length=1, description="该批到货对应的原料规格版本")
+    quantity_received: float = Field(gt=0, description="收货量")
+    received_at: Optional[str] = Field(default=None, description="收货时刻 ISO8601")
+    expires_at: Optional[str] = Field(default=None, description="有效期（失效日期）ISO8601")
+    status: Literal["pending", "released", "quarantined"] = Field(
+        default="pending",
+        description="质检状态：pending 待检 / released 放行 / quarantined 隔离")
+
+
+class LotStatusUpdate(BaseModel):
+    """批号质检状态变更（待检/放行/隔离）。"""
+
+    status: Literal["pending", "released", "quarantined"]
+    reason: Optional[str] = Field(default=None, description="变更原因（如检验单号）")
+
+
+class AllocationItem(BaseModel):
+    lot_id: str = Field(min_length=1)
+    quantity: float = Field(gt=0, description="投料用量，不得超过批号余量")
+
+
+class AllocationCreate(BaseModel):
+    """为生产批次分配一个或多个原料批号及用量；幂等键防重复扣量。"""
+
+    idempotency_key: str = Field(min_length=1,
+                                 description="幂等键；同键重放复用原结果，不重复扣量")
+    items: list[AllocationItem] = Field(min_length=1)
+
+
+class AllocationReverse(BaseModel):
+    """开工前撤销分配：记一笔反向流水恢复批号余量。"""
+
+    reason: str = Field(min_length=1)

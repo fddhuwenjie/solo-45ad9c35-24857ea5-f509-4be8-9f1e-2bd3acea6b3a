@@ -8,6 +8,7 @@
 - **问题检测**：资料缺口、别名混用、循环引用、无法展开的复合原料、“无某过敏原”宣称与资料的矛盾；
 - **生命周期**：草拟 → 复核 → 批准 → 撤回，未决矛盾阻止批准；
 - **影响传播**：配方/规格更新沿依赖图标记受影响产品；拭子结果补录沿返工影响链标记批次标签；批准记录只读并派生新修订；
+- **投料谱系**：到货批号记录供应商批号、对应规格、收货量、有效期与待检/放行/隔离状态；为生产批次分配一个或多个批号及用量（未放行/已过期/余量不足/规格不符配方均拒绝，幂等键防重复扣量）；来源图按开工锁定的投料规格展开，用料缺项记证据空白；供应商更正沿扣料关系圈出涉事成品、标签与已发放卷标；开工前可撤销分配并记反向流水；
 - **印刷批次领用放行**：印刷卷标按批准修订入库（规范化文案摘要），领用时核对标签仍 approved、无 stale、产品匹配、未失效、余量充足，并把待包装批次当前分析与批准快照/印刷摘要逐项对照；撤回、规格变化、阳性拭子冻结剩余卷标并列出处置批次；
 - **审核覆盖**：审核人可覆盖自动结论，但必须填写理由并关联输入证据；
 - **报告**：两版声明比较（增删 + 波及范围）、JSON 核对包、可打印审查单、请求样例。
@@ -18,7 +19,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（38 + 21 个印刷批次放行测试）
+python -m pytest tests/                        # 端到端测试（59 + 11 个投料谱系测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -28,10 +29,11 @@ python -m pytest tests/                        # 端到端测试（38 + 21 个�
 ```
 配方(版本) ──┐
 原料规格版本 ─┼─> 来源图展开 ─> 过敏原证据(带路径) ─> 推导应声明项 ─┐
-供应商声明 ──┘                                                 ├─> 发现项
+供应商声明 ──┘        ↑ 批次有投料记录时按开工锁定规格展开          ├─> 发现项
 前序含敏原批次 ─┐                                            ┌─┘
 清洁程序(有效期/覆盖过敏原) ─┼─> 逐批次追溯 ─> 开放/关闭路径 ─┘
 清洁记录/拭子定量(必检点) ─┤            ↑ 返工料去向（可跨产品、可传递）
+到货批号 ─> 投料分配(锁定规格/扣量流水) ─> 供应商更正沿扣料关系波及
 标签文案 ───────────────────────────────> 比对 ──> 批准/阻断
 ```
 
@@ -66,7 +68,7 @@ python -m pytest tests/                        # 端到端测试（38 + 21 个�
 
 | kind | 级别 | 含义 |
 |---|---|---|
-| `data_gap` | blocker | 未知原料引用 / 缺规格版本 / 缺供应商声明 / 过敏原状态未知 / 拭子阳性超限（`missing=cleaning_validation`） |
+| `data_gap` | blocker | 未知原料引用 / 缺规格版本 / 缺供应商声明 / 过敏原状态未知 / 拭子阳性超限（`missing=cleaning_validation`）/ 批次用料记录缺项（`missing=material_allocation`） |
 | `alias_conflict` | blocker / warning | 引用命中多个原料（blocker）；同一名称或别名被多个原料使用（warning） |
 | `circular_reference` | blocker | 复合原料子成分沿路径回到祖先 |
 | `unexpandable_compound` | blocker | 标记为复合原料但无子成分拆分 |
@@ -101,6 +103,23 @@ swab:{swab_id}                                 拭子结果
 - `PUT /swabs/{id}/result` 补录拭子定量结果时自动处理：草稿/复核中标签立即重新分析（阴性补录可消解“结果待出”的开放路径）；结果超限且采样点/过敏原属程序验证对象时，沿返工影响链传播，已批准标签标记 `stale` 并派生新修订，调用方无需手工触发；
 - `approvals` 表只插不改；批准快照永久保留文案、推导、发现项，以及**逐批次追溯采用的清洁程序版本、清洁记录与拭子结果**——后续补录不再改写已冻结快照。
 
+## 投料谱系
+
+同名原料的到货批号可能分别采用不同规格版本；只记配方版本时，供应商更正过敏原声明后无法圈出真正消耗过该批原料的成品。投料谱系把“哪一批原料投进了哪个生产批次”落成可审计的扣量关系：
+
+1. `POST /lots` 登记到货批号：供应商批号（同一原料下唯一）、对应规格版本、收货量、有效期与质检状态（`pending` 待检 / `released` 放行 / `quarantined` 隔离）；`PUT /lots/{id}/status` 变更质检状态。
+2. `POST /batches/{batch_id}/allocations` 为生产批次分配一个或多个批号及用量，门禁逐项核对：
+   - 批号须为 `released`（待检/隔离拒绝，`not_released`）；
+   - 未过期（按批次开工时刻，缺省按当前日期，`expired`）；
+   - 余量充足（同一请求内相同批号用量合并核对，`insufficient_quantity`）；
+   - 规格符合配方：原料须在当前配方中（`ingredient_not_in_recipe`），配方项锁定版本时批号规格须一致（`spec_mismatch`）。
+
+   任一不符整体拒绝（409 + `failures`），不部分扣量。幂等键唯一：同键同内容重放复用原结果（不重复扣量），同键内容冲突 409——已扣量只增不减，没有倒扣入口。
+3. **锁定规格展开**：批次一旦存在有效投料记录，来源图（`/source-graph`、标签分析、放行门禁、核对包）按开工时锁定的投料规格展开，证据带 `lot_ids`；配方项缺用料记录时记 `data_gap`（`missing=material_allocation`，blocker）证据空白，**不回退最新规格**。批次无投料记录时保持旧的现行规格展开（兼容未启用批号管理的资料）。
+4. **供应商更正波及链**：登记新规格版本时，若该原料已有到货批号，则沿扣料关系定位消耗过旧规格批号的批次——受影响标签按批次影响链处理（草稿/复核中重新分析，已批准标 stale 并派生新修订），该修订下仍有余量的印刷批次冻结；响应 `correction` 列明涉事批号与用量（`affected_lots.consumed_by`）、声明差异（`declaration_changes`）与处置边界（`disposition_boundary`：受影响标签、冻结卷标、已发放到包装现场的生产批次），`unaffected_products` 中的其他成品保持原状态。原料尚无到货批号时回退旧的依赖图影响传播。
+5. `POST /allocations/{id}/reverse` 开工前撤销分配：记一笔 `reverse` 反向流水恢复批号余量；批次已开工（`started_at` 不晚于当前日期）后不可撤销。全部撤销后来源图回退现行规格展开。
+6. 审计还原：批次查询（`GET /batches/{id}`）带 `allocations` 与 `lot_ledger`；批准快照冻结当时的投料批号/规格/用量（`material_allocations`）；核对包 `material_genealogy` 汇总分配、批号、扣量流水与波及该批次的更正事件；审查单含投料谱系小节；事件日志记录 `lot_registered / lot_status_changed / lots_allocated / allocation_reversed / supplier_correction`。
+
 ## 印刷标签批次领用放行
 
 现场若只核对产品名，换版或阳性拭子补录后旧版卷标仍可能被贴上新产品批次。印刷卷标按“印刷批次”单独管理，放行是批准快照与待包装批次当前分析之间的最后核对：
@@ -132,6 +151,8 @@ swab:{swab_id}                                 拭子结果
 | POST | `/cleaning-records` | 清洁执行记录（批次、设备段、程序版本、清洁日期） |
 | POST | `/swabs` · PUT `/swabs/{id}/result` | 拭子登记（`value_ppm` 可空=待出）/ 定量结果补录（自动影响传播） |
 | POST | `/rework-paths` | 返工料去向（可跨产品，拒绝成环） |
+| POST | `/lots` · PUT `/lots/{id}/status` · GET `/lots/{id}` | 到货批号登记（供应商批号/规格/收货量/有效期/质检状态）· 状态变更 · 详情（余量/分配/流水） |
+| POST | `/batches/{id}/allocations` · POST `/allocations/{id}/reverse` | 投料分配（门禁 + 幂等）· 开工前撤销（反向流水） |
 | GET | `/products/{id}/source-graph?batch_id=` | 来源图 + 批次追溯 + 推导 + 发现项 |
 | GET | `/products/{id}/impact` | 依赖视图与标签过期状态 |
 | GET | `/products/{id}/labels/compare?from_revision=&to_revision=` | 两版声明增删 + 波及范围 |
@@ -158,10 +179,12 @@ label_audit/
   engine.py   规则引擎：展开、推导、检测、影响、比较
   trace.py    逐批次追溯：路径开闭、返工链、批准快照证据
   printing.py 印刷批次：文案规范化摘要、放行逐项对照、影响冻结
+  genealogy.py 投料谱系：分配门禁、锁定规格、更正波及链、反向流水
   db.py       SQLite 持久层（approvals 只读）
   report.py   JSON 核对包 / 可打印审查单
 samples/compound_coline.json   请求样例
 tests/test_api.py              16 个端到端测试
-tests/test_batch_trace.py      21 个逐批追溯/补录传播回归测试
+tests/test_batch_trace.py      22 个逐批追溯/补录传播回归测试
 tests/test_print_batches.py    21 个印刷批次领用放行/冻结/处置回归测试
+tests/test_genealogy.py        11 个投料谱系/更正波及/撤销流水测试
 ```

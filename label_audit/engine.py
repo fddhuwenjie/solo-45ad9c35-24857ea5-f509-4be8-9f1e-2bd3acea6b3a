@@ -102,8 +102,13 @@ def resolve_ref(store, ref: str):
     ), None
 
 
-def expand_recipe(store, product_id: str) -> Expansion:
-    """从产品当前配方出发，递归展开复合原料，构建来源图并收集证据与发现项。"""
+def expand_recipe(store, product_id: str, batch_id: str | None = None) -> Expansion:
+    """从产品当前配方出发，递归展开复合原料，构建来源图并收集证据与发现项。
+
+    指定 batch_id 且该批次存在有效投料记录时，顶层配方项按开工时锁定的
+    投料规格展开；配方项缺用料记录时记 data_gap(material_allocation)
+    证据空白，不回退最新规格。批次无投料记录时保持现行规格展开。
+    """
     exp = Expansion()
     recipe = store.current_recipe(product_id)
     if recipe is None:
@@ -112,14 +117,20 @@ def expand_recipe(store, product_id: str) -> Expansion:
             {"product_id": product_id, "missing": "recipe"}, subject=f"recipe:{product_id}",
         ))
         return exp
+    locked = None
+    if batch_id:
+        from .genealogy import locked_specs_for_batch  # 延迟导入避免循环依赖
+
+        locked = locked_specs_for_batch(store, batch_id)
     for item in recipe["items"]:
         _expand_ref(store, item["ingredient_ref"], item.get("version"), [], exp,
-                    percentage=item.get("percentage"))
+                    percentage=item.get("percentage"), locked=locked)
     _detect_alias_mixing(exp)
     return exp
 
 
-def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None) -> None:
+def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None,
+                locked=None) -> None:
     if len(path) >= MAX_DEPTH:
         exp.findings.append(Finding(
             "data_gap", BLOCKER, f"展开深度超过 {MAX_DEPTH} 层，疑似数据异常",
@@ -141,6 +152,34 @@ def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None) -> N
             subject="cycle:" + ">".join(sorted(set(cycle))),
         ))
         return
+    # 投料谱系：批次已登记投料记录时，顶层配方项必须使用开工锁定的投料规格
+    if locked is not None and not path:
+        entries = locked.get(iid)
+        if not entries:
+            exp.referenced.add(iid)
+            exp.findings.append(Finding(
+                "data_gap", BLOCKER,
+                f"批次投料记录缺少原料 {iid}（{ing['name']}）的用料记录，"
+                f"无法锁定实际投料规格，不得回退为最新规格",
+                {"ingredient_id": iid, "missing": "material_allocation",
+                 "path": "(配方顶层)"},
+                subject=f"alloc:{iid}",
+            ))
+            return
+        by_version: dict[str, list] = {}
+        for e in entries:
+            by_version.setdefault(e["spec_version"], []).append(e)
+        for spec_version in sorted(by_version):
+            _expand_version(store, ing, spec_version, path, exp, percentage,
+                            note, lots=by_version[spec_version])
+        return
+    _expand_version(store, ing, version, path, exp, percentage, note)
+
+
+def _expand_version(store, ing, version, path, exp: Expansion, percentage,
+                    note, lots=None) -> None:
+    """按指定规格版本展开一个已解析的原料；lots 为锁定的投料批号（可空）。"""
+    iid = ing["id"]
     ver = store.get_version(iid, version) if version else store.current_version(iid)
     node_path = path + [{
         "ingredient_id": iid,
@@ -149,6 +188,10 @@ def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None) -> N
     }]
     exp.referenced.add(iid)
     terms = {norm(ing["name"])} | {norm(a) for a in ing["aliases"]}
+    if lots:
+        lot_note = ("投料批号 " + "、".join(f"{l['lot_id']}×{l['quantity']}" for l in lots)
+                    + f"（开工锁定规格 {ver['version'] if ver else version}）")
+        note = f"{note}；{lot_note}" if note else lot_note
     exp.nodes.append(GraphNode(
         ingredient_id=iid,
         version=ver["version"] if ver else version,
@@ -184,7 +227,7 @@ def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None) -> N
                 subject=f"decl:{iid}:{ver['version']}:{allergen}",
             ))
         elif d["status"] in ("present", "may_contain"):
-            exp.add_evidence(allergen, {
+            ev = {
                 "allergen": allergen,
                 "status": d["status"],
                 "ingredient_id": iid,
@@ -192,7 +235,10 @@ def _expand_ref(store, ref, version, path, exp: Expansion, percentage=None) -> N
                 "path": fmt_path(node_path),
                 "source": f"spec:{iid}:{ver['version']}",
                 "declaration_ref": d.get("source"),
-            })
+            }
+            if lots:
+                ev["lot_ids"] = sorted({l["lot_id"] for l in lots})
+            exp.add_evidence(allergen, ev)
     if ing["is_compound"]:
         subs = ver["sub_components"]
         if not subs:
@@ -278,6 +324,8 @@ def _evidence_summary(evs: list[dict]) -> list[dict]:
         if e.get("source_batch_id"):
             item["source_batch_id"] = e["source_batch_id"]
             item["source_kind"] = e.get("source_kind")
+        if e.get("lot_ids"):
+            item["lot_ids"] = e["lot_ids"]
         if e.get("evidence_gaps"):
             item["evidence_gaps"] = e["evidence_gaps"]
         out.append(item)
@@ -350,7 +398,7 @@ def analyze_label(store, label_id: str, batch_id: str | None = None) -> dict:
         store.set_label_batch(label_id, batch_id)
     else:
         batch_id = None
-    exp = expand_recipe(store, label["product_id"])
+    exp = expand_recipe(store, label["product_id"], batch_id=batch_id)
     derived = derive_declarations(store, label["product_id"], exp, batch_id=batch_id)
     findings = exp.findings + compare_with_copy(label["copy"], derived)
     if batch_id:

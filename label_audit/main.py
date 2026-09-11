@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
-from . import __version__, engine, printing, report, trace
+from . import __version__, engine, genealogy, printing, report, trace
 from .db import Store, utcnow
 from .models import (
+    AllocationCreate,
+    AllocationReverse,
     ApproveRequest,
     BatchCreate,
     CleaningProgramCreate,
@@ -19,6 +21,8 @@ from .models import (
     LabelCopyUpdate,
     LabelCreate,
     LineCreate,
+    LotStatusUpdate,
+    MaterialLotCreate,
     OverrideRequest,
     PrintBatchCreate,
     PrintBatchDispose,
@@ -83,7 +87,11 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
     @app.post("/ingredients/{ingredient_id}/versions", status_code=201, tags=["资料登记"])
     def add_ingredient_version(ingredient_id: str, body: IngredientVersionCreate,
                                store: Store = Depends(get_store)):
-        """登记新规格版本（如供应商更换），随后沿依赖图标记受影响产品。"""
+        """登记新规格版本（供应商更换/声明更正），随后沿依赖关系传播影响。
+
+        原料已启用批号管理时，沿扣料关系定位消耗过旧规格批号的批次、标签与
+        已发放卷标（未消耗涉事批号的成品保持原状态）；否则回退依赖图传播。
+        """
         if store.get_ingredient(ingredient_id) is None:
             raise HTTPException(404, f"原料 {ingredient_id} 不存在")
         if store.get_version(ingredient_id, body.version):
@@ -93,9 +101,8 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             [s.model_dump() for s in body.sub_components],
             [d.model_dump() for d in body.supplier_declarations],
         )
-        impacted = engine.impacted_products(store, [ingredient_id])
-        actions = engine.apply_impact(store, impacted, reason=f"新规格版本 {ingredient_id}@{body.version}")
-        return {"version": ver, "impacted_products": sorted(impacted), "actions": actions}
+        impact = genealogy.correction_impact(store, ingredient_id, body.version)
+        return {"version": ver, **impact}
 
     @app.post("/products", status_code=201, tags=["资料登记"])
     def create_product(body: ProductCreate, store: Store = Depends(get_store)):
@@ -159,7 +166,9 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         batch = _batch_or_404(batch_id, store)
         return {**batch,
                 "rework_in": store.rework_into(batch_id),
-                "rework_out": store.rework_from(batch_id)}
+                "rework_out": store.rework_from(batch_id),
+                "allocations": store.allocations_for_batch(batch_id),
+                "lot_ledger": store.ledger_for_batch(batch_id)}
 
     @app.get("/batches/{batch_id}/trace", tags=["批次追溯"])
     def batch_trace(batch_id: str, store: Store = Depends(get_store)):
@@ -270,7 +279,7 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         if batch_id and batch is None:
             raise HTTPException(404, f"批次 {batch_id} 不存在")
         resolved_batch_id = batch["batch_id"] if batch else None
-        exp = engine.expand_recipe(store, product_id)
+        exp = engine.expand_recipe(store, product_id, batch_id=resolved_batch_id)
         derived = engine.derive_declarations(store, product_id, exp,
                                              batch_id=resolved_batch_id)
         return {
@@ -383,6 +392,9 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         if batch_id:
             snapshot["batch_id"] = batch_id
             snapshot["batch_trace_evidence"] = trace.batch_trace_evidence(store, batch_id)
+            # 冻结开工时锁定的投料批号/规格/用量：后续更正不改写已批准快照
+            snapshot["material_allocations"] = \
+                genealogy.batch_material_evidence(store, batch_id)["allocations"]
         approval = store.add_approval(label_id, body.approved_by, snapshot)
         store.set_label_status(label_id, "approved")
         return {"approval": approval, "label": _label_view(store, store.get_label(label_id))}
@@ -598,6 +610,114 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         updated = store.create_disposition(print_batch_id, body.action,
                                            body.quantity, body.reason)
         return _print_batch_view(store, updated)
+
+    # ------------------------------------------------------------- 投料谱系
+    def _lot_view(store: Store, lot: dict) -> dict:
+        return {**lot,
+                "allocations": store.allocations_for_lot(lot["lot_id"]),
+                "ledger": store.ledger_for_lot(lot["lot_id"])}
+
+    @app.post("/lots", status_code=201, tags=["投料谱系"])
+    def register_lot(body: MaterialLotCreate, store: Store = Depends(get_store)):
+        """登记原料到货批号：供应商批号、对应规格版本、收货量、有效期与质检状态。"""
+        if store.get_ingredient(body.ingredient_id) is None:
+            raise HTTPException(404, f"原料 {body.ingredient_id} 不存在")
+        if store.get_version(body.ingredient_id, body.spec_version) is None:
+            raise HTTPException(
+                404, f"原料 {body.ingredient_id} 的规格版本 {body.spec_version} 不存在")
+        if store.get_lot(body.lot_id):
+            raise HTTPException(409, f"原料批号 {body.lot_id} 已存在")
+        if store.lot_by_supplier_no(body.ingredient_id, body.supplier_lot_no):
+            raise HTTPException(
+                409, f"原料 {body.ingredient_id} 的供应商批号 "
+                     f"{body.supplier_lot_no} 已登记，不得重复到货")
+        if body.received_at and body.expires_at and body.expires_at < body.received_at:
+            raise HTTPException(422, "有效期不得早于收货时刻")
+        lot = store.create_lot(
+            body.lot_id, body.ingredient_id, body.supplier_lot_no, body.spec_version,
+            body.quantity_received, body.received_at, body.expires_at, body.status)
+        return _lot_view(store, lot)
+
+    @app.get("/lots/{lot_id}", tags=["投料谱系"])
+    def get_lot(lot_id: str, store: Store = Depends(get_store)):
+        lot = store.get_lot(lot_id)
+        if lot is None:
+            raise HTTPException(404, f"原料批号 {lot_id} 不存在")
+        return _lot_view(store, lot)
+
+    @app.put("/lots/{lot_id}/status", tags=["投料谱系"])
+    def set_lot_status(lot_id: str, body: LotStatusUpdate, store: Store = Depends(get_store)):
+        """变更批号质检状态（待检/放行/隔离）；仅放行状态可投料。"""
+        if store.get_lot(lot_id) is None:
+            raise HTTPException(404, f"原料批号 {lot_id} 不存在")
+        lot = store.set_lot_status(lot_id, body.status, body.reason)
+        return _lot_view(store, lot)
+
+    @app.post("/batches/{batch_id}/allocations", tags=["投料谱系"])
+    def allocate_lots(batch_id: str, body: AllocationCreate, response: Response,
+                      store: Store = Depends(get_store)):
+        """为生产批次分配一个或多个原料批号及用量（开工时锁定投料规格）。
+
+        门禁：批号须已放行、未过期（按批次开工时刻，缺省按当前日期）、余量
+        充足、规格符合配方（配方项锁定版本须一致且原料须在配方中）；任一不
+        符整体拒绝（409 + failures），不部分扣量。幂等键唯一：同键同内容
+        重放复用原结果、不重复扣量；同键内容冲突返回 409。
+        """
+        batch = _batch_or_404(batch_id, store)
+        payload = {"batch_id": batch_id,
+                   "items": sorted(({"lot_id": i.lot_id, "quantity": i.quantity}
+                                    for i in body.items),
+                                   key=lambda x: (x["lot_id"], x["quantity"]))}
+        prior = store.allocation_request_by_key(body.idempotency_key)
+        if prior is not None:
+            if prior["batch_id"] != batch_id or prior["payload"] != payload:
+                raise HTTPException(
+                    409, {"error": "幂等键重复但请求内容不一致，已扣量不可倒扣",
+                          "idempotency_key": body.idempotency_key,
+                          "original": prior["payload"],
+                          "conflicting": payload})
+            response.status_code = 200
+            return {"request_id": prior["request_id"], "batch_id": batch_id,
+                    "allocations": [store.get_allocation(a)
+                                    for a in prior["allocation_ids"]],
+                    "reused": True}
+        result = genealogy.evaluate_allocation(
+            store, batch, [i.model_dump() for i in body.items])
+        if result["failures"]:
+            raise HTTPException(
+                409, {"error": "投料分配未通过门禁，未扣量", "failures": result["failures"]})
+        created = genealogy.apply_allocation(store, batch, body.idempotency_key,
+                                             payload, result["items"])
+        response.status_code = 201
+        return {"request_id": created["request_id"], "batch_id": batch_id,
+                "allocations": created["allocations"], "reused": False}
+
+    @app.post("/allocations/{allocation_id}/reverse", tags=["投料谱系"])
+    def reverse_allocation(allocation_id: str, body: AllocationReverse,
+                           store: Store = Depends(get_store)):
+        """开工前撤销分配：记一笔 reverse 反向流水恢复批号余量。
+
+        批次已开工（started_at 不晚于当前日期）后不可撤销；撤销后该批次若
+        不再有任何有效投料记录，来源图回退为现行规格展开。
+        """
+        allocation = store.get_allocation(allocation_id)
+        if allocation is None:
+            raise HTTPException(404, f"投料分配 {allocation_id} 不存在")
+        if allocation["status"] != "active":
+            raise HTTPException(409, f"分配 {allocation_id} 已撤销，不得重复操作")
+        batch = store.get_batch(allocation["batch_id"])
+        started = (batch.get("started_at") or "")[:10] if batch else ""
+        if started and started <= utcnow()[:10]:
+            raise HTTPException(
+                409, {"error": f"批次 {allocation['batch_id']} 已开工"
+                               f"（{batch['started_at']}），不得撤销投料分配",
+                      "batch_started_at": batch["started_at"]})
+        result = genealogy.reverse_allocation(store, allocation, body.reason)
+        # 撤销改变批次实际投料：草稿/复核中标签按同一批次重新分析
+        actions = engine.apply_batch_impact(
+            store, [allocation["batch_id"]], positive=False,
+            reason=f"撤销投料分配 {allocation_id}：{body.reason}")
+        return {**result, "actions": actions}
 
     # ------------------------------------------------------------- 报告
     @app.get("/labels/{label_id}/check-package", tags=["报告"])

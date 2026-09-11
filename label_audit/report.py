@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 
-from . import trace
+from . import genealogy, trace
 from .db import utcnow
 from .engine import analyze_label, expand_recipe
 
@@ -15,11 +15,17 @@ def build_check_package(store, label_id: str) -> dict:
         raise KeyError(f"label {label_id} not found")
     product = store.get_product(label["product_id"])
     recipe = store.current_recipe(label["product_id"])
-    exp = expand_recipe(store, label["product_id"])
+    batch_id = store.get_label_batch(label_id)
+    exp = expand_recipe(store, label["product_id"], batch_id=batch_id)
     findings = store.findings_for_label(label_id)
     approvals = store.approvals_for_label(label_id)
-    batch_id = store.get_label_batch(label_id)
     batch_evidence = trace.batch_trace_evidence(store, batch_id) if batch_id else None
+    material_genealogy = None
+    if batch_id:
+        material_genealogy = {
+            **genealogy.batch_material_evidence(store, batch_id),
+            "spec_corrections": genealogy.corrections_for_batch(store, batch_id),
+        }
 
     spec_refs = sorted({e["source"] for b in (label["derived"] or {}).values()
                         for evs in b.values() for e in evs
@@ -98,6 +104,7 @@ def build_check_package(store, label_id: str) -> dict:
         "approvals": approvals,
         "batch_id": batch_id,
         "batch_trace": batch_evidence["trace"] if batch_evidence else None,
+        "material_genealogy": material_genealogy,
         "print_control": {
             "label_id": label_id,
             "print_batches": print_batches,
@@ -202,6 +209,51 @@ def build_review_sheet(store, label_id: str) -> str:
                 "<th>失效时刻</th><th>领用生产批次（分析版本）</th></tr>"
                 f"{body}</table>")
 
+    def genealogy_section() -> str:
+        if not batch_id:
+            return "<table><tr><td class='empty'>未绑定生产批次</td></tr></table>"
+        ev = genealogy.batch_material_evidence(store, batch_id)
+        if not ev["allocations"]:
+            return "<table><tr><td class='empty'>（无投料记录；来源图按现行规格展开）</td></tr></table>"
+        lots = {l["lot_id"]: l for l in ev["lots"]}
+        body = ""
+        for a in ev["allocations"]:
+            lot = lots.get(a["lot_id"], {})
+            body += (
+                f"<tr><td>{_esc(a['lot_id'])}</td>"
+                f"<td>{_esc(lot.get('supplier_lot_no') or '—')}</td>"
+                f"<td>{_esc(a['ingredient_id'])}</td>"
+                f"<td>{_esc(a['spec_version'])}</td>"
+                f"<td>{a['quantity']}</td>"
+                f"<td>{_esc(a['status'])}</td></tr>")
+        ledger = "".join(
+            f"<tr><td>{_esc(e['created_at'])}</td><td>{_esc(e['kind'])}</td>"
+            f"<td>{_esc(e['lot_id'])}</td><td>{e['quantity']}</td>"
+            f"<td>{_esc(e['reason'] or '—')}</td></tr>"
+            for e in ev["ledger"])
+        corrections = genealogy.corrections_for_batch(store, batch_id)
+
+        def _corr_text(c) -> str:
+            parts = ["{}: {}→{}（{}）".format(ch["allergen"], ch["old_status"],
+                                             ch["new_status"], ch["spec_version"])
+                     for ch in c["declaration_changes"]]
+            return "；".join(parts) or "—"
+
+        corr = "".join(
+            "<tr><td>{}</td><td>{}@{}</td><td>{}</td></tr>".format(
+                _esc(c["ts"]), _esc(c["ingredient_id"]), _esc(c["new_version"]),
+                _esc(_corr_text(c)))
+            for c in corrections)
+        return ("<table><tr><th>原料批号</th><th>供应商批号</th><th>原料</th>"
+                "<th>锁定规格</th><th>投料用量</th><th>分配状态</th></tr>"
+                f"{body}</table>"
+                "<h3>扣量流水</h3>"
+                "<table><tr><th>时间</th><th>类型</th><th>批号</th><th>数量</th>"
+                f"<th>原因</th></tr>{ledger}</table>"
+                + ("<h3>供应商更正波及</h3>"
+                   "<table><tr><th>时间</th><th>更正规格</th><th>声明差异</th></tr>"
+                   f"{corr}</table>" if corrections else ""))
+
     sheet = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>标签审查单 - {_esc(product['name'])} 第{label['revision']}版</title>
@@ -259,7 +311,10 @@ def build_review_sheet(store, label_id: str) -> str:
 <h2>七、印刷标签批次领用放行</h2>
 {print_section()}
 
-<h2>八、签字</h2>
+<h2>八、投料谱系（锁定规格与扣量流水）</h2>
+{genealogy_section()}
+
+<h2>九、签字</h2>
 <table class="sign"><tr><th>环节</th><th>签字</th><th>日期</th><th>备注</th></tr>
 {''.join(f"<tr><td>{s}</td><td></td><td></td><td></td></tr>" for s in ('草拟', '复核', '批准', '撤回'))}
 </table>

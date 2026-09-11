@@ -55,7 +55,7 @@ def current_basis(store, label: dict, production_batch: dict) -> dict:
     修订所属产品——同一卷标适用多个产品时，各产品的应声明项可能不同。
     """
     product_id = production_batch["product_id"]
-    exp = expand_recipe(store, product_id)
+    exp = expand_recipe(store, product_id, batch_id=production_batch["batch_id"])
     derived = derive_declarations(store, product_id, exp,
                                   batch_id=production_batch["batch_id"])
     findings = list(exp.findings) + compare_with_copy(label["copy"], derived)

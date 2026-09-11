@@ -179,6 +179,48 @@ CREATE TABLE IF NOT EXISTS print_dispositions (
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- 投料谱系：原料到货批号、投料分配（开工锁定规格）与扣量流水
+CREATE TABLE IF NOT EXISTS material_lots (
+    lot_id TEXT PRIMARY KEY,
+    ingredient_id TEXT NOT NULL,
+    supplier_lot_no TEXT NOT NULL,
+    spec_version TEXT NOT NULL,
+    quantity_received REAL NOT NULL,
+    received_at TEXT,
+    expires_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    UNIQUE (ingredient_id, supplier_lot_no)
+);
+CREATE TABLE IF NOT EXISTS lot_allocation_requests (
+    request_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    batch_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    allocation_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lot_allocations (
+    allocation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    lot_id TEXT NOT NULL,
+    ingredient_id TEXT NOT NULL,
+    spec_version TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lot_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    allocation_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 # 标签生命周期：draft -> in_review -> approved -> withdrawn
@@ -186,6 +228,11 @@ LABEL_STATUSES = ("draft", "in_review", "approved", "withdrawn")
 # 印刷批次状态：available 可领用 -> frozen（影响传播冻结剩余）/ closed（余量归零）
 PRINT_BATCH_STATUSES = ("available", "frozen", "closed")
 PRINT_DISPOSITION_ACTIONS = ("scrap", "quarantine")
+# 原料批号质检状态：pending 待检 -> released 放行 / quarantined 隔离（隔离可再放行）
+LOT_STATUSES = ("pending", "released", "quarantined")
+# 投料分配状态：active 有效 -> reversed 已撤销（仅开工前，记反向流水）
+ALLOCATION_STATUSES = ("active", "reversed")
+LEDGER_KINDS = ("allocate", "reverse")
 
 
 def utcnow() -> str:
@@ -954,5 +1001,188 @@ class Store:
             "status": status,
             "frozen_reason": r["frozen_reason"],
             "frozen_at": r["frozen_at"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 原料到货批号
+    def create_lot(self, lot_id: str, ingredient_id: str, supplier_lot_no: str,
+                   spec_version: str, quantity_received: float,
+                   received_at: str | None, expires_at: str | None, status: str) -> dict:
+        assert status in LOT_STATUSES
+        self._exec(
+            "INSERT INTO material_lots (lot_id, ingredient_id, supplier_lot_no,"
+            " spec_version, quantity_received, received_at, expires_at, status, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (lot_id, ingredient_id, supplier_lot_no, spec_version, quantity_received,
+             received_at, expires_at, status, utcnow()),
+        )
+        self.log_event("lot_registered", {
+            "lot_id": lot_id, "ingredient_id": ingredient_id,
+            "supplier_lot_no": supplier_lot_no, "spec_version": spec_version,
+            "quantity_received": quantity_received, "status": status})
+        return self.get_lot(lot_id)
+
+    def get_lot(self, lot_id: str) -> dict | None:
+        r = self._one("SELECT * FROM material_lots WHERE lot_id = ?", (lot_id,))
+        return self._decode_lot(r) if r else None
+
+    def lot_by_supplier_no(self, ingredient_id: str, supplier_lot_no: str) -> dict | None:
+        r = self._one(
+            "SELECT * FROM material_lots WHERE ingredient_id = ? AND supplier_lot_no = ?",
+            (ingredient_id, supplier_lot_no))
+        return self._decode_lot(r) if r else None
+
+    def lots_for_ingredient(self, ingredient_id: str) -> list[dict]:
+        return [
+            self._decode_lot(r)
+            for r in self._q(
+                "SELECT * FROM material_lots WHERE ingredient_id = ? ORDER BY rowid",
+                (ingredient_id,))
+        ]
+
+    def set_lot_status(self, lot_id: str, status: str, reason: str | None = None) -> dict:
+        assert status in LOT_STATUSES
+        old = self.get_lot(lot_id)
+        self._exec("UPDATE material_lots SET status = ? WHERE lot_id = ?", (status, lot_id))
+        self.log_event("lot_status_changed", {
+            "lot_id": lot_id, "old_status": old["status"] if old else None,
+            "new_status": status, "reason": reason})
+        return self.get_lot(lot_id)
+
+    def allocated_quantity(self, lot_id: str) -> float:
+        """批号当前有效（未撤销）投料总量；撤销的分配由反向流水恢复余量。"""
+        r = self._one(
+            "SELECT COALESCE(SUM(quantity),0) AS s FROM lot_allocations"
+            " WHERE lot_id = ? AND status = 'active'",
+            (lot_id,))
+        return float(r["s"])
+
+    def _decode_lot(self, r: sqlite3.Row) -> dict:
+        allocated = self.allocated_quantity(r["lot_id"])
+        return {
+            "lot_id": r["lot_id"],
+            "ingredient_id": r["ingredient_id"],
+            "supplier_lot_no": r["supplier_lot_no"],
+            "spec_version": r["spec_version"],
+            "quantity_received": r["quantity_received"],
+            "allocated_quantity": allocated,
+            "remaining_quantity": r["quantity_received"] - allocated,
+            "received_at": r["received_at"],
+            "expires_at": r["expires_at"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 投料分配
+    def create_allocation_request(self, request_id: str, idempotency_key: str,
+                                  batch_id: str, payload: dict,
+                                  allocation_ids: list[str]) -> dict:
+        self._exec(
+            "INSERT INTO lot_allocation_requests"
+            " (request_id, idempotency_key, batch_id, payload, allocation_ids, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (request_id, idempotency_key, batch_id,
+             json.dumps(payload, ensure_ascii=False, sort_keys=True),
+             json.dumps(allocation_ids, ensure_ascii=False), utcnow()),
+        )
+        return self.allocation_request_by_key(idempotency_key)
+
+    def allocation_request_by_key(self, idempotency_key: str) -> dict | None:
+        r = self._one(
+            "SELECT * FROM lot_allocation_requests WHERE idempotency_key = ?",
+            (idempotency_key,))
+        if not r:
+            return None
+        return {
+            "request_id": r["request_id"],
+            "idempotency_key": r["idempotency_key"],
+            "batch_id": r["batch_id"],
+            "payload": _loads(r["payload"], {}),
+            "allocation_ids": _loads(r["allocation_ids"], []),
+            "created_at": r["created_at"],
+        }
+
+    def create_allocation(self, allocation_id: str, request_id: str, batch_id: str,
+                          lot_id: str, ingredient_id: str, spec_version: str,
+                          quantity: float) -> dict:
+        self._exec(
+            "INSERT INTO lot_allocations (allocation_id, request_id, batch_id, lot_id,"
+            " ingredient_id, spec_version, quantity, status, created_at)"
+            " VALUES (?,?,?,?,?,?,?,'active',?)",
+            (allocation_id, request_id, batch_id, lot_id, ingredient_id, spec_version,
+             quantity, utcnow()),
+        )
+        return self.get_allocation(allocation_id)
+
+    def get_allocation(self, allocation_id: str) -> dict | None:
+        r = self._one("SELECT * FROM lot_allocations WHERE allocation_id = ?",
+                      (allocation_id,))
+        return self._decode_allocation(r) if r else None
+
+    def allocations_for_batch(self, batch_id: str, active_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM lot_allocations WHERE batch_id = ?"
+        if active_only:
+            sql += " AND status = 'active'"
+        return [self._decode_allocation(r)
+                for r in self._q(sql + " ORDER BY rowid", (batch_id,))]
+
+    def allocations_for_lot(self, lot_id: str, active_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM lot_allocations WHERE lot_id = ?"
+        if active_only:
+            sql += " AND status = 'active'"
+        return [self._decode_allocation(r)
+                for r in self._q(sql + " ORDER BY rowid", (lot_id,))]
+
+    def set_allocation_reversed(self, allocation_id: str) -> dict:
+        self._exec("UPDATE lot_allocations SET status = 'reversed' WHERE allocation_id = ?",
+                   (allocation_id,))
+        return self.get_allocation(allocation_id)
+
+    @staticmethod
+    def _decode_allocation(r: sqlite3.Row) -> dict:
+        return {
+            "allocation_id": r["allocation_id"],
+            "request_id": r["request_id"],
+            "batch_id": r["batch_id"],
+            "lot_id": r["lot_id"],
+            "ingredient_id": r["ingredient_id"],
+            "spec_version": r["spec_version"],
+            "quantity": r["quantity"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 扣量流水
+    def add_ledger_entry(self, lot_id: str, batch_id: str, allocation_id: str,
+                         kind: str, quantity: float, reason: str | None = None) -> dict:
+        assert kind in LEDGER_KINDS
+        cur = self._exec(
+            "INSERT INTO lot_ledger (lot_id, batch_id, allocation_id, kind, quantity,"
+            " reason, created_at) VALUES (?,?,?,?,?,?,?)",
+            (lot_id, batch_id, allocation_id, kind, quantity, reason, utcnow()),
+        )
+        r = self._one("SELECT * FROM lot_ledger WHERE id = ?", (cur.lastrowid,))
+        return self._decode_ledger(r)
+
+    def ledger_for_lot(self, lot_id: str) -> list[dict]:
+        return [self._decode_ledger(r)
+                for r in self._q("SELECT * FROM lot_ledger WHERE lot_id = ? ORDER BY id",
+                                 (lot_id,))]
+
+    def ledger_for_batch(self, batch_id: str) -> list[dict]:
+        return [self._decode_ledger(r)
+                for r in self._q("SELECT * FROM lot_ledger WHERE batch_id = ? ORDER BY id",
+                                 (batch_id,))]
+
+    @staticmethod
+    def _decode_ledger(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "lot_id": r["lot_id"],
+            "batch_id": r["batch_id"],
+            "allocation_id": r["allocation_id"],
+            "kind": r["kind"],
+            "quantity": r["quantity"],
+            "reason": r["reason"],
             "created_at": r["created_at"],
         }
