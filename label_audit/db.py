@@ -366,6 +366,8 @@ class Store:
 
         - 新指纹插入为 open；
         - 已存在的指纹保留原状态（open / overridden），从而保留审核人的覆盖；
+        - 曾标为 resolved 的指纹若被重新检出，恢复为 open（刷新说明与细节），
+          重新参与批准门禁；
         - 不再出现的指纹标记为 resolved（保留历史，不参与阻断）。
         """
         existing = {r["fingerprint"]: r for r in self._findings_rows(label_id)}
@@ -373,12 +375,18 @@ class Store:
         for f in findings:
             incoming.setdefault(f.fingerprint, f)
         for fp, f in incoming.items():
-            if fp not in existing:
+            row = existing.get(fp)
+            if row is None:
                 self._exec(
                     "INSERT INTO findings (label_id, fingerprint, kind, severity, status, message, detail)"
                     " VALUES (?,?,?,?,'open',?,?)",
                     (label_id, fp, f.kind, f.severity, f.message,
                      json.dumps(f.detail, ensure_ascii=False)),
+                )
+            elif row["status"] == "resolved":
+                self._exec(
+                    "UPDATE findings SET status = 'open', message = ?, detail = ? WHERE id = ?",
+                    (f.message, json.dumps(f.detail, ensure_ascii=False), row["id"]),
                 )
         for fp, row in existing.items():
             if fp not in incoming and row["status"] != "resolved":

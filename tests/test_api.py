@@ -320,6 +320,53 @@ def test_recipe_update_marks_label_stale(client):
     assert set(impact["referenced_ingredients"]) == {"FLOUR"}
 
 
+# ---------------------------------------------------------------- 发现项生命周期
+
+def test_reappearing_finding_reopens_and_blocks_approval(client):
+    """open -> resolved -> 再次出现：发现项必须重新打开，批准被拦截。"""
+    seed_base(client)
+    missing_wheat = {
+        "declared_allergens": ["soy"],
+        "may_contain": ["milk", "peanut"],
+        "free_from_claims": [],
+    }
+    full = {
+        "declared_allergens": ["wheat", "soy"],
+        "may_contain": ["milk", "peanut"],
+        "free_from_claims": [],
+    }
+    # 1. 初次检出 missing_declaration(wheat)，状态 open
+    label = make_label(client, "COOKIE", missing_wheat)
+    lid = label["id"]
+    hits = [f for f in label["findings"] if f["kind"] == "missing_declaration"]
+    assert len(hits) == 1 and hits[0]["status"] == "open"
+    assert hits[0]["detail"]["allergen"] == "wheat"
+    fp = hits[0]["fingerprint"]
+
+    # 2. 补入 wheat -> 同一指纹转为 resolved，open_blockers 清空
+    client.put(f"/labels/{lid}/copy", json={"copy": full})
+    view = client.get(f"/labels/{lid}").json()
+    assert view["open_blockers"] == []
+    assert all(f["fingerprint"] != fp for f in view["findings"])  # resolved 不再列出
+
+    # 3. 再次删除 wheat -> 同一指纹必须恢复为 open
+    client.put(f"/labels/{lid}/copy", json={"copy": missing_wheat})
+    view = client.get(f"/labels/{lid}").json()
+    reopened = [f for f in view["findings"] if f["fingerprint"] == fp]
+    assert len(reopened) == 1 and reopened[0]["status"] == "open"
+    assert {b["kind"] for b in view["open_blockers"]} == {"missing_declaration"}
+
+    # 4. 提交复核后批准必须被拒：不写批准记录、不进入 approved
+    assert client.post(f"/labels/{lid}/submit").status_code == 200
+    res = client.post(f"/labels/{lid}/approve", json={"approved_by": "qa.lead"})
+    assert res.status_code == 409
+    assert any(b["kind"] == "missing_declaration"
+               for b in res.json()["detail"]["open_blockers"])
+    view = client.get(f"/labels/{lid}").json()
+    assert view["status"] == "in_review"
+    assert view["approvals"] == []
+
+
 # ---------------------------------------------------------------- 报告与样例
 
 def test_check_package_and_review_sheet(client):
