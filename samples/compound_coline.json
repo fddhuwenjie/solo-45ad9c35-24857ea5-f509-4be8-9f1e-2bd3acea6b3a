@@ -1,0 +1,113 @@
+{
+  "name": "复合原料 + 共线冲突：曲奇标签审核",
+  "description": "巧克力豆（复合原料）含大豆磷脂子成分，供应商声明其可能含奶；产品在与奶、花生共线的产线生产，而标签却宣称“无奶”。按 steps 顺序重放即可复现全部发现项。",
+  "base_url": "http://localhost:8000",
+  "steps": [
+    {
+      "comment": "1. 登记大豆磷脂（叶子原料，供应商声明含大豆）",
+      "method": "POST", "path": "/ingredients", "expected_status": 201,
+      "body": {"id": "LEC", "name": "大豆磷脂", "aliases": ["卵磷脂", "soy lecithin"], "is_compound": false}
+    },
+    {
+      "comment": "2. 大豆磷脂规格 v1：供应商声明 soy=present",
+      "method": "POST", "path": "/ingredients/LEC/versions", "expected_status": 201,
+      "body": {"version": "v1", "supplier_declarations": [{"allergen": "soy", "status": "present", "source": "SUP-DECL-2026-031"}]}
+    },
+    {
+      "comment": "3. 登记白砂糖（故意不给供应商声明 -> 演示资料缺口）",
+      "method": "POST", "path": "/ingredients", "expected_status": 201,
+      "body": {"id": "SUGAR", "name": "白砂糖", "aliases": [], "is_compound": false}
+    },
+    {
+      "comment": "4. 白砂糖规格 v1：无供应商声明",
+      "method": "POST", "path": "/ingredients/SUGAR/versions", "expected_status": 201,
+      "body": {"version": "v1", "supplier_declarations": []}
+    },
+    {
+      "comment": "5. 登记面粉，声明含小麦",
+      "method": "POST", "path": "/ingredients", "expected_status": 201,
+      "body": {"id": "FLOUR", "name": "小麦粉", "aliases": ["面粉"], "is_compound": false}
+    },
+    {
+      "comment": "6. 面粉规格 v1",
+      "method": "POST", "path": "/ingredients/FLOUR/versions", "expected_status": 201,
+      "body": {"version": "v1", "supplier_declarations": [{"allergen": "wheat", "status": "present", "source": "SUP-DECL-2026-018"}]}
+    },
+    {
+      "comment": "7. 登记巧克力豆（复合原料）",
+      "method": "POST", "path": "/ingredients", "expected_status": 201,
+      "body": {"id": "CHOC", "name": "巧克力豆", "aliases": ["choc chips"], "is_compound": true}
+    },
+    {
+      "comment": "8. 巧克力豆规格 v2（换供应商后）：子成分按别名“卵磷脂”引用（不锁版本，跟随最新规格），并声明 milk=may_contain",
+      "method": "POST", "path": "/ingredients/CHOC/versions", "expected_status": 201,
+      "body": {
+        "version": "v2",
+        "sub_components": [
+          {"ingredient_ref": "卵磷脂", "percentage": 2},
+          {"ingredient_ref": "SUGAR", "version": "v1", "percentage": 45}
+        ],
+        "supplier_declarations": [{"allergen": "milk", "status": "may_contain", "source": "SUP-DECL-2026-102"}]
+      }
+    },
+    {
+      "comment": "9. 登记产品与配方",
+      "method": "POST", "path": "/products", "expected_status": 201,
+      "body": {"id": "COOKIE", "name": "巧克力曲奇"}
+    },
+    {
+      "comment": "10. 配方 v1",
+      "method": "POST", "path": "/products/COOKIE/recipes", "expected_status": 201,
+      "body": {
+        "version": "v1",
+        "items": [
+          {"ingredient_ref": "FLOUR", "version": "v1", "percentage": 55},
+          {"ingredient_ref": "CHOC", "version": "v2", "percentage": 40},
+          {"ingredient_ref": "SUGAR", "version": "v1", "percentage": 5}
+        ]
+      }
+    },
+    {
+      "comment": "11. 登记 1 号产线：处理奶与花生（共线）",
+      "method": "POST", "path": "/lines", "expected_status": 201,
+      "body": {"id": "L1", "name": "1号产线", "allergens_handled": ["milk", "peanut"]}
+    },
+    {
+      "comment": "12. 曲奇在 1 号产线生产",
+      "method": "POST", "path": "/products/COOKIE/lines/L1", "expected_status": 201,
+      "body": {}
+    },
+    {
+      "comment": "13. 创建标签草稿：只声明小麦，且宣称“无奶” -> 触发矛盾与缺失",
+      "method": "POST", "path": "/labels", "expected_status": 201,
+      "body": {
+        "product_id": "COOKIE",
+        "copy": {
+          "declared_allergens": ["wheat"],
+          "may_contain": [],
+          "free_from_claims": ["milk"],
+          "ingredients_text": "小麦粉、巧克力豆、白砂糖"
+        }
+      }
+    },
+    {
+      "comment": "14. 查看分析：来源图、推导应声明项与发现项",
+      "method": "GET", "path": "/labels/{label_id}/analysis", "expected_status": 200
+    },
+    {
+      "comment": "15. 提交复核后尝试批准 -> 409（存在未决 blocker）",
+      "method": "POST", "path": "/labels/{label_id}/submit", "expected_status": 200
+    },
+    {
+      "comment": "16. 批准被拒绝",
+      "method": "POST", "path": "/labels/{label_id}/approve", "expected_status": 409,
+      "body": {"approved_by": "qa.lead"}
+    }
+  ],
+  "expected_findings": [
+    {"kind": "missing_declaration", "severity": "blocker", "why": "巧克力豆子成分大豆磷脂含 soy，标签未声明"},
+    {"kind": "claim_contradiction", "severity": "blocker", "why": "宣称“无奶”，但巧克力豆供应商声明 milk=may_contain 且 1 号产线共线处理 milk"},
+    {"kind": "missing_cross_contact", "severity": "warning", "why": "milk/peanut 交叉接触风险未在标签提示"},
+    {"kind": "data_gap", "severity": "blocker", "why": "白砂糖缺少供应商过敏原声明"}
+  ]
+}
