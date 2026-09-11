@@ -225,8 +225,15 @@ def _detect_alias_mixing(exp: Expansion) -> None:
 
 # ---------------------------------------------------------------------- 推导
 
-def derive_declarations(store, product_id: str, exp: Expansion) -> dict:
-    """由证据推导应声明项：present -> 必须声明；may_contain 与共线 -> 交叉接触提示。"""
+def derive_declarations(store, product_id: str, exp: Expansion,
+                        batch_id: str | None = None) -> dict:
+    """由证据推导应声明项：present -> 必须声明；may_contain 与共线 -> 交叉接触提示。
+
+    共线风险不再按产线 allergens_handled 静态推导：
+    当产品有生产批次时，逐批次追溯（前序含敏原批次 + 返工路径，
+    仅保留清洁/拭子证据无法关闭的开放路径）。
+    未登记任何批次时回退到产线历史登记（保守兼容旧资料）。
+    """
     required: dict[str, list] = {}
     may: dict[str, list] = {}
     for allergen, evs in exp.evidence.items():
@@ -236,29 +243,45 @@ def derive_declarations(store, product_id: str, exp: Expansion) -> dict:
             required[allergen] = present + maybe
         elif maybe:
             may[allergen] = maybe
-    for line in store.lines_for_product(product_id):
-        for a in line["allergens_handled"]:
-            a = norm(a)
+
+    batch = store.get_batch(batch_id) if batch_id else store.latest_batch_for_product(product_id)
+    if batch is not None:
+        from .trace import open_cross_contact  # 延迟导入避免循环依赖
+
+        for a, evs in open_cross_contact(store, batch["batch_id"]).items():
             if a in required:
                 continue
-            may.setdefault(a, []).append({
-                "allergen": a,
-                "status": "cross_contact",
-                "ingredient_id": None,
-                "version": None,
-                "path": f"产线 {line['name']}（共线）",
-                "source": f"line:{line['id']}",
-                "declaration_ref": None,
-            })
+            may.setdefault(a, []).extend(evs)
+    else:
+        for line in store.lines_for_product(product_id):
+            for a in line["allergens_handled"]:
+                a = norm(a)
+                if a in required:
+                    continue
+                may.setdefault(a, []).append({
+                    "allergen": a,
+                    "status": "cross_contact",
+                    "ingredient_id": None,
+                    "version": None,
+                    "path": f"产线 {line['name']}（共线，未登记批次，按历史登记保守推导）",
+                    "source": f"line:{line['id']}",
+                    "declaration_ref": None,
+                })
     return {"required": required, "may_contain": may}
 
 
 def _evidence_summary(evs: list[dict]) -> list[dict]:
-    return [
-        {"path": e["path"], "status": e["status"], "source": e["source"],
-         **({"declaration_ref": e["declaration_ref"]} if e.get("declaration_ref") else {})}
-        for e in evs
-    ]
+    out = []
+    for e in evs:
+        item = {"path": e["path"], "status": e["status"], "source": e["source"],
+                **({"declaration_ref": e["declaration_ref"]} if e.get("declaration_ref") else {})}
+        if e.get("source_batch_id"):
+            item["source_batch_id"] = e["source_batch_id"]
+            item["source_kind"] = e.get("source_kind")
+        if e.get("evidence_gaps"):
+            item["evidence_gaps"] = e["evidence_gaps"]
+        out.append(item)
+    return out
 
 
 def compare_with_copy(copy: dict, derived: dict) -> list[Finding]:
@@ -310,19 +333,36 @@ def compare_with_copy(copy: dict, derived: dict) -> list[Finding]:
 
 # ---------------------------------------------------------------------- 分析编排
 
-def analyze_label(store, label_id: str) -> dict:
-    """对一个标签修订执行完整分析：展开 -> 推导 -> 比对 -> 落库。"""
+def analyze_label(store, label_id: str, batch_id: str | None = None) -> dict:
+    """对一个标签修订执行完整分析：展开 -> 批次追溯 -> 推导 -> 比对 -> 落库。
+
+    batch_id 缺省时使用标签已绑定的批次，再缺省取产品最新批次。
+    """
+    from .trace import trace_batch, trace_findings
+
     label = store.get_label(label_id)
     if label is None:
         raise KeyError(f"label {label_id} not found")
+    batch_id = batch_id or store.get_label_batch(label_id)
+    batch = store.get_batch(batch_id) if batch_id else store.latest_batch_for_product(label["product_id"])
+    if batch is not None:
+        batch_id = batch["batch_id"]
+        store.set_label_batch(label_id, batch_id)
+    else:
+        batch_id = None
     exp = expand_recipe(store, label["product_id"])
-    derived = derive_declarations(store, label["product_id"], exp)
+    derived = derive_declarations(store, label["product_id"], exp, batch_id=batch_id)
     findings = exp.findings + compare_with_copy(label["copy"], derived)
+    if batch_id:
+        findings += trace_findings(store, batch_id, label["copy"])
     store.sync_findings(label_id, findings)
     store.set_label_derived(label_id, derived)
     store.set_stale(label_id, False)
+    trace = trace_batch(store, batch_id) if batch_id else None
     return {
         "label_id": label_id,
+        "batch_id": batch_id,
+        "batch_trace": trace,
         "graph": [n.as_dict() for n in exp.nodes],
         "derived": derived,
         "findings": store.findings_for_label(label_id, include_resolved=False),
@@ -368,6 +408,56 @@ def apply_impact(store, product_ids, reason: str) -> list[dict]:
                                 "revision": new_label["revision"],
                                 "action": "derived_new_revision"})
     store.log_event("impact_applied", {"reason": reason, "actions": actions})
+    return actions
+
+
+def impacted_batches_via_rework(store, batch_ids) -> set[str]:
+    """返工影响链：从给定批次出发，沿返工去向（可跨产品、可传递）扩展。"""
+    hit = set(batch_ids)
+    frontier = list(batch_ids)
+    while frontier:
+        b = frontier.pop()
+        for rw in store.rework_from(b):
+            t = rw["target_batch_id"]
+            if t not in hit and store.get_batch(t) is not None:
+                hit.add(t)
+                frontier.append(t)
+    return hit
+
+
+def apply_batch_impact(store, batch_ids, reason: str) -> list[dict]:
+    """阳性补录后的沿链影响：
+
+    - 草稿/复核中标签：重新分析（同一绑定批次），开放路径立即重开；
+    - 已批准标签：冻结的批准记录不动，标记 stale 并派生新修订（草稿、重新分析）；
+    - 已撤回标签：仅记录，不派生。
+    """
+    actions = []
+    for bid in sorted(batch_ids):
+        for label_id in store.labels_for_batch(bid):
+            label = store.get_label(label_id)
+            if label is None:
+                continue
+            if label["status"] in ("draft", "in_review"):
+                analyze_label(store, label_id, batch_id=bid)
+                actions.append({"batch_id": bid, "label_id": label_id,
+                                "product_id": label["product_id"],
+                                "revision": label["revision"],
+                                "action": "reanalyzed"})
+            elif label["status"] == "approved":
+                store.set_stale(label_id, True)
+                new_label = store.create_label(label["product_id"], label["copy"],
+                                               parent_id=label["id"])
+                store.set_label_batch(new_label["id"], bid)
+                analyze_label(store, new_label["id"], batch_id=bid)
+                actions.append({"batch_id": bid, "label_id": label_id,
+                                "product_id": label["product_id"],
+                                "revision": label["revision"], "action": "marked_stale"})
+                actions.append({"batch_id": bid, "label_id": new_label["id"],
+                                "product_id": label["product_id"],
+                                "revision": new_label["revision"],
+                                "action": "derived_new_revision"})
+    store.log_event("batch_impact_applied", {"reason": reason, "actions": actions})
     return actions
 
 

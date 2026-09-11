@@ -83,6 +83,66 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     payload TEXT NOT NULL DEFAULT '{}'
 );
+-- 逐批次共线追溯：批次、设备段、清洁程序版本、清洁/拭子记录、返工去向
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL,
+    line_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    started_at TEXT,
+    allergens TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE (line_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS batch_segments (
+    batch_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    name TEXT,
+    PRIMARY KEY (batch_id, segment_id)
+);
+CREATE TABLE IF NOT EXISTS cleaning_programs (
+    program_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    line_id TEXT,
+    allergens TEXT NOT NULL DEFAULT '[]',
+    required_points TEXT NOT NULL DEFAULT '[]',
+    valid_from TEXT,
+    valid_until TEXT,
+    limit_ppm REAL NOT NULL DEFAULT 2.0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (program_id, version)
+);
+CREATE TABLE IF NOT EXISTS cleaning_records (
+    record_id TEXT PRIMARY KEY,
+    line_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    program_id TEXT NOT NULL,
+    program_version TEXT NOT NULL,
+    cleaned_at TEXT
+);
+CREATE TABLE IF NOT EXISTS swab_results (
+    swab_id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL,
+    point_id TEXT NOT NULL,
+    allergen TEXT NOT NULL,
+    value_ppm REAL NOT NULL,
+    sampled_at TEXT,
+    FOREIGN KEY (record_id) REFERENCES cleaning_records(record_id)
+);
+CREATE TABLE IF NOT EXISTS rework_paths (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_batch_id TEXT NOT NULL,
+    target_batch_id TEXT NOT NULL,
+    percentage REAL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source_batch_id, target_batch_id)
+);
+-- 标签修订分析时实际采用的批次（缺省取产品最新批次）
+CREATE TABLE IF NOT EXISTS label_batches (
+    label_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL
+);
 """
 
 # 标签生命周期：draft -> in_review -> approved -> withdrawn
@@ -426,6 +486,227 @@ class Store:
             "detail": _loads(r["detail"], {}),
             "override": _loads(r["override_json"], None),
         }
+
+    # ------------------------------------------------------------------ 批次与逐批追溯
+    def create_batch(self, batch_id: str, product_id: str, line_id: str, sequence: int,
+                     started_at: str | None, allergens: list[str],
+                     segments: list[dict]) -> dict:
+        self._exec(
+            "INSERT INTO batches (batch_id, product_id, line_id, sequence, started_at,"
+            " allergens, created_at) VALUES (?,?,?,?,?,?,?)",
+            (batch_id, product_id, line_id, sequence, started_at,
+             json.dumps(allergens, ensure_ascii=False), utcnow()),
+        )
+        for seg in segments:
+            self._exec(
+                "INSERT INTO batch_segments (batch_id, segment_id, name) VALUES (?,?,?)",
+                (batch_id, seg["segment_id"], seg.get("name")),
+            )
+        self.log_event("batch_created", {"batch_id": batch_id, "product_id": product_id,
+                                         "line_id": line_id, "sequence": sequence,
+                                         "allergens": allergens})
+        return self.get_batch(batch_id)
+
+    def get_batch(self, batch_id: str) -> dict | None:
+        r = self._one("SELECT * FROM batches WHERE batch_id = ?", (batch_id,))
+        return self._decode_batch(r) if r else None
+
+    def _decode_batch(self, r: sqlite3.Row) -> dict:
+        return {
+            "batch_id": r["batch_id"], "product_id": r["product_id"],
+            "line_id": r["line_id"], "sequence": r["sequence"],
+            "started_at": r["started_at"], "allergens": _loads(r["allergens"], []),
+            "segments": self.segments_for_batch(r["batch_id"]),
+        }
+
+    def segments_for_batch(self, batch_id: str) -> list[dict]:
+        return [
+            {"segment_id": r["segment_id"], "name": r["name"]}
+            for r in self._q(
+                "SELECT segment_id, name FROM batch_segments WHERE batch_id = ? ORDER BY rowid",
+                (batch_id,))
+        ]
+
+    def batches_for_product(self, product_id: str) -> list[dict]:
+        return [
+            self._decode_batch(r)
+            for r in self._q("SELECT * FROM batches WHERE product_id = ? ORDER BY sequence",
+                             (product_id,))
+        ]
+
+    def latest_batch_for_product(self, product_id: str) -> dict | None:
+        r = self._one(
+            "SELECT * FROM batches WHERE product_id = ? ORDER BY sequence DESC, rowid DESC LIMIT 1",
+            (product_id,))
+        return self._decode_batch(r) if r else None
+
+    def batches_on_line(self, line_id: str) -> list[dict]:
+        return [
+            self._decode_batch(r)
+            for r in self._q("SELECT * FROM batches WHERE line_id = ? ORDER BY sequence", (line_id,))
+        ]
+
+    def previous_batches(self, batch: dict) -> list[dict]:
+        """同一产线上序号严格更小的批次（按序号倒序），用于向前追溯含敏原批次。"""
+        return [
+            self._decode_batch(r)
+            for r in self._q(
+                "SELECT * FROM batches WHERE line_id = ? AND sequence < ? ORDER BY sequence DESC",
+                (batch["line_id"], batch["sequence"]))
+        ]
+
+    # --------------------------------------------------------- 清洁程序版本与有效期
+    def create_cleaning_program(self, program_id: str, version: str, line_id: str | None,
+                                allergens: list[str], required_points: list[str],
+                                valid_from: str | None, valid_until: str | None,
+                                limit_ppm: float) -> dict:
+        self._exec(
+            "INSERT INTO cleaning_programs VALUES (?,?,?,?,?,?,?,?,?)",
+            (program_id, version, line_id, json.dumps(allergens, ensure_ascii=False),
+             json.dumps(required_points, ensure_ascii=False), valid_from, valid_until,
+             limit_ppm, utcnow()),
+        )
+        self.log_event("cleaning_program_created",
+                       {"program_id": program_id, "version": version, "allergens": allergens})
+        return self.get_cleaning_program(program_id, version)
+
+    def get_cleaning_program(self, program_id: str, version: str) -> dict | None:
+        r = self._one(
+            "SELECT * FROM cleaning_programs WHERE program_id = ? AND version = ?",
+            (program_id, version))
+        return self._decode_program(r) if r else None
+
+    @staticmethod
+    def _decode_program(r: sqlite3.Row) -> dict:
+        return {
+            "program_id": r["program_id"], "version": r["version"], "line_id": r["line_id"],
+            "allergens": _loads(r["allergens"], []),
+            "required_points": _loads(r["required_points"], []),
+            "valid_from": r["valid_from"], "valid_until": r["valid_until"],
+            "limit_ppm": r["limit_ppm"],
+        }
+
+    # --------------------------------------------------------- 清洁执行记录与拭子
+    def create_cleaning_record(self, record_id: str, line_id: str, batch_id: str,
+                               segment_id: str, program_id: str, program_version: str,
+                               cleaned_at: str | None) -> dict:
+        self._exec(
+            "INSERT INTO cleaning_records VALUES (?,?,?,?,?,?,?)",
+            (record_id, line_id, batch_id, segment_id, program_id, program_version, cleaned_at),
+        )
+        self.log_event("cleaning_record_created",
+                       {"record_id": record_id, "batch_id": batch_id, "segment_id": segment_id,
+                        "program": f"{program_id}@{program_version}"})
+        return self.get_cleaning_record(record_id)
+
+    def get_cleaning_record(self, record_id: str) -> dict | None:
+        r = self._one("SELECT * FROM cleaning_records WHERE record_id = ?", (record_id,))
+        return self._decode_cleaning_record(r) if r else None
+
+    @staticmethod
+    def _decode_cleaning_record(r: sqlite3.Row) -> dict:
+        return {
+            "record_id": r["record_id"], "line_id": r["line_id"], "batch_id": r["batch_id"],
+            "segment_id": r["segment_id"], "program_id": r["program_id"],
+            "program_version": r["program_version"], "cleaned_at": r["cleaned_at"],
+        }
+
+    def cleaning_records_for_batch(self, batch_id: str, segment_id: str | None = None) -> list[dict]:
+        if segment_id is None:
+            rows = self._q(
+                "SELECT * FROM cleaning_records WHERE batch_id = ? ORDER BY rowid", (batch_id,))
+        else:
+            rows = self._q(
+                "SELECT * FROM cleaning_records WHERE batch_id = ? AND segment_id = ? ORDER BY rowid",
+                (batch_id, segment_id))
+        return [self._decode_cleaning_record(r) for r in rows]
+
+    def create_swab(self, swab_id: str, record_id: str, point_id: str, allergen: str,
+                    value_ppm: float | None, sampled_at: str | None) -> dict:
+        self._exec(
+            "INSERT INTO swab_results VALUES (?,?,?,?,?,?)",
+            (swab_id, record_id, point_id, allergen, value_ppm, sampled_at),
+        )
+        self.log_event("swab_created", {"swab_id": swab_id, "record_id": record_id,
+                                        "point_id": point_id, "allergen": allergen,
+                                        "value_ppm": value_ppm})
+        return self.get_swab(swab_id)
+
+    def get_swab(self, swab_id: str) -> dict | None:
+        r = self._one("SELECT * FROM swab_results WHERE swab_id = ?", (swab_id,))
+        return self._decode_swab(r) if r else None
+
+    def set_swab_value(self, swab_id: str, value_ppm: float, sampled_at: str | None) -> dict:
+        """实验室定量结果补录（可能在标签批准之后）。"""
+        self._exec(
+            "UPDATE swab_results SET value_ppm = ?, sampled_at = COALESCE(?, sampled_at)"
+            " WHERE swab_id = ?",
+            (value_ppm, sampled_at, swab_id),
+        )
+        self.log_event("swab_backfilled", {"swab_id": swab_id, "value_ppm": value_ppm})
+        return self.get_swab(swab_id)
+
+    def swabs_for_record(self, record_id: str) -> list[dict]:
+        return [
+            self._decode_swab(r)
+            for r in self._q("SELECT * FROM swab_results WHERE record_id = ? ORDER BY rowid",
+                             (record_id,))
+        ]
+
+    @staticmethod
+    def _decode_swab(r: sqlite3.Row) -> dict:
+        return {
+            "swab_id": r["swab_id"], "record_id": r["record_id"], "point_id": r["point_id"],
+            "allergen": r["allergen"], "value_ppm": r["value_ppm"], "sampled_at": r["sampled_at"],
+        }
+
+    # ------------------------------------------------------------------ 返工去向
+    def add_rework_path(self, source_batch_id: str, target_batch_id: str,
+                        percentage: float | None) -> dict:
+        self._exec(
+            "INSERT INTO rework_paths (source_batch_id, target_batch_id, percentage, created_at)"
+            " VALUES (?,?,?,?)",
+            (source_batch_id, target_batch_id, percentage, utcnow()),
+        )
+        self.log_event("rework_path_added",
+                       {"source_batch_id": source_batch_id, "target_batch_id": target_batch_id,
+                        "percentage": percentage})
+        return {"source_batch_id": source_batch_id, "target_batch_id": target_batch_id,
+                "percentage": percentage}
+
+    def rework_into(self, batch_id: str) -> list[dict]:
+        """余料投入本批次的返工路径。"""
+        return [
+            {"source_batch_id": r["source_batch_id"], "target_batch_id": r["target_batch_id"],
+             "percentage": r["percentage"]}
+            for r in self._q(
+                "SELECT * FROM rework_paths WHERE target_batch_id = ? ORDER BY id", (batch_id,))
+        ]
+
+    def rework_from(self, batch_id: str) -> list[dict]:
+        """本批次余料的去向（用于阳性结果影响链）。"""
+        return [
+            {"source_batch_id": r["source_batch_id"], "target_batch_id": r["target_batch_id"],
+             "percentage": r["percentage"]}
+            for r in self._q(
+                "SELECT * FROM rework_paths WHERE source_batch_id = ? ORDER BY id", (batch_id,))
+        ]
+
+    # ------------------------------------------------------------------ 标签-批次绑定
+    def set_label_batch(self, label_id: str, batch_id: str) -> None:
+        self._exec(
+            "INSERT INTO label_batches (label_id, batch_id) VALUES (?,?)"
+            " ON CONFLICT(label_id) DO UPDATE SET batch_id = excluded.batch_id",
+            (label_id, batch_id),
+        )
+
+    def get_label_batch(self, label_id: str) -> str | None:
+        r = self._one("SELECT batch_id FROM label_batches WHERE label_id = ?", (label_id,))
+        return r["batch_id"] if r else None
+
+    def labels_for_batch(self, batch_id: str) -> list[str]:
+        return [r["label_id"] for r in self._q(
+            "SELECT label_id FROM label_batches WHERE batch_id = ?", (batch_id,))]
 
     # ------------------------------------------------------------------ 批准记录（只读）
     def add_approval(self, label_id: str, approved_by: str, snapshot: dict) -> dict:
