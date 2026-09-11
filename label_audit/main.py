@@ -7,8 +7,8 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from . import __version__, engine, report, trace
-from .db import Store
+from . import __version__, engine, printing, report, trace
+from .db import Store, utcnow
 from .models import (
     ApproveRequest,
     BatchCreate,
@@ -20,6 +20,9 @@ from .models import (
     LabelCreate,
     LineCreate,
     OverrideRequest,
+    PrintBatchCreate,
+    PrintBatchDispose,
+    PrintBatchIssue,
     ProductCreate,
     RecipeCreate,
     ReworkPathCreate,
@@ -390,8 +393,13 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         if label["status"] != "approved":
             raise HTTPException(409, f"仅已批准的标签可撤回，当前状态 {label['status']}")
         store.set_label_status(label_id, "withdrawn")
-        store.log_event("label_withdrawn", {"label_id": label_id, "reason": body.reason})
-        return _label_view(store, store.get_label(label_id))
+        reason = f"标签撤回：{body.reason}"
+        print_freeze = printing.freeze_for_label(store, label_id, reason=reason)
+        store.log_event("label_withdrawn", {"label_id": label_id, "reason": body.reason,
+                                            "print_freeze": print_freeze})
+        view = _label_view(store, store.get_label(label_id))
+        view["print_freeze"] = print_freeze
+        return view
 
     @app.post("/labels/{label_id}/reanalyze", tags=["分析"])
     def reanalyze(label_id: str, batch_id: str | None = None,
@@ -435,6 +443,161 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                     "evidence_refs": body.evidence_refs}
         store.set_override(finding_id, override)
         return store.get_finding(finding_id)
+
+    # ------------------------------------------------------------- 印刷标签批次
+    def _print_batch_or_404(print_batch_id: str, store: Store) -> dict:
+        pb = store.get_print_batch(print_batch_id)
+        if pb is None:
+            raise HTTPException(404, f"印刷批次 {print_batch_id} 不存在")
+        return pb
+
+    def _print_batch_view(store: Store, pb: dict) -> dict:
+        return {**pb,
+                "issuances": store.issuances_for_print_batch(pb["print_batch_id"]),
+                "dispositions": store.dispositions_for_print_batch(pb["print_batch_id"])}
+
+    @app.post("/print-batches", status_code=201, tags=["印刷标签批次"])
+    def register_print_batch(body: PrintBatchCreate, store: Store = Depends(get_store)):
+        """登记印刷标签批次入库：关联已批准标签修订，固化文案规范化摘要。"""
+        if store.get_print_batch(body.print_batch_id):
+            raise HTTPException(409, f"印刷批次 {body.print_batch_id} 已存在")
+        label = _label_or_404(store, body.label_id)
+        if label["status"] != "approved":
+            raise HTTPException(409, f"标签修订须为 approved 才能送印，当前状态 "
+                                    f"{label['status']}")
+        if body.received_at and body.expires_at and body.expires_at < body.received_at:
+            raise HTTPException(422, "失效时刻不得早于入库时刻")
+        applicable = body.applicable_product_ids or [label["product_id"]]
+        missing = [pid for pid in applicable if store.get_product(pid) is None]
+        if missing:
+            raise HTTPException(404, f"适用产品不存在：{sorted(set(missing))}")
+        if label["product_id"] not in applicable:
+            raise HTTPException(422, f"适用产品必须包含标签所属产品 {label['product_id']}")
+        summary = printing.canonical_copy_summary(label["copy"])
+        if body.copy_summary is not None:
+            provided = printing.canonical_copy_summary(body.copy_summary.model_dump())
+            if provided != summary:
+                raise HTTPException(
+                    422, {"error": "送印文案摘要与批准文案不一致，旧版/失效文案不得入库",
+                          "diff": engine._copy_diff(
+                              {"declared_allergens": provided["declared_allergens"],
+                               "may_contain": provided["may_contain"],
+                               "free_from_claims": provided["free_from_claims"]},
+                              {"declared_allergens": summary["declared_allergens"],
+                               "may_contain": summary["may_contain"],
+                               "free_from_claims": summary["free_from_claims"]}),
+                          "provided_ingredients_text": provided["ingredients_text"],
+                          "approved_ingredients_text": summary["ingredients_text"]})
+        pb = store.create_print_batch(
+            body.print_batch_id, label["id"], label["product_id"],
+            sorted(set(applicable)), summary, body.quantity_received,
+            body.received_at, body.expires_at)
+        return _print_batch_view(store, pb)
+
+    @app.get("/print-batches/{print_batch_id}", tags=["印刷标签批次"])
+    def get_print_batch(print_batch_id: str, store: Store = Depends(get_store)):
+        return _print_batch_view(store, _print_batch_or_404(print_batch_id, store))
+
+    @app.post("/print-batches/{print_batch_id}/issue", tags=["印刷标签批次"])
+    def issue_print_batch(print_batch_id: str, body: PrintBatchIssue,
+                          store: Store = Depends(get_store)):
+        """领用放行：门禁逐项核对通过后绑定生产批次；幂等键重复时复用原结果。
+
+        门禁顺序：标签仍 approved 且无 stale 标记；印刷批次可领用且未失效；
+        待包装批次属于适用产品；余量充足；再把当前分析声明与批准快照、
+        印刷摘要逐项对照，任一不符 409 并附差异路径。
+        """
+        prior = store.issuance_by_idempotency_key(body.idempotency_key)
+        if prior is not None:
+            if prior["print_batch_id"] != print_batch_id:
+                raise HTTPException(
+                    409, {"error": "幂等键已用于其他印刷批次",
+                          "idempotency_key": body.idempotency_key,
+                          "original_print_batch_id": prior["print_batch_id"]})
+            if prior["production_batch_id"] != body.production_batch_id \
+                    or prior["quantity"] != body.quantity:
+                raise HTTPException(
+                    409, {"error": "幂等键重复但请求内容不一致，已领用数量不可倒扣",
+                          "idempotency_key": body.idempotency_key,
+                          "original": {"production_batch_id": prior["production_batch_id"],
+                                       "quantity": prior["quantity"]},
+                          "conflicting": {"production_batch_id": body.production_batch_id,
+                                          "quantity": body.quantity}})
+            return {"issuance": prior, "reused": True,
+                    "analysis_version": prior["analysis_version"]}
+
+        pb = _print_batch_or_404(print_batch_id, store)
+        label = store.get_label(pb["label_id"])
+        if label is None:
+            raise HTTPException(500, f"印刷批次 {print_batch_id} 的标签修订缺失，数据异常")
+        # 先核对标签修订本身：撤回 / stale 的标签不得再放行（即使印刷批次尚未冻结）
+        if label["status"] != "approved":
+            raise HTTPException(409, {"error": "标签修订不再是 approved，禁止放行",
+                                     "label_status": label["status"],
+                                     "differences": [{
+                                         "path": "label.status",
+                                         "expected": "approved",
+                                         "actual": label["status"]}]})
+        if label["stale"]:
+            raise HTTPException(409, {"error": "标签修订已带 stale 标记（规格/追溯资料变化），"
+                                               "禁止放行",
+                                     "differences": [{"path": "label.stale",
+                                                      "expected": False, "actual": True}]})
+        if pb["status"] != "available":
+            raise HTTPException(409, {"error": f"印刷批次当前状态 {pb['status']}，不可领用",
+                                     "status": pb["status"],
+                                     "frozen_reason": pb.get("frozen_reason")})
+        batch = store.get_batch(body.production_batch_id)
+        if batch is None:
+            raise HTTPException(404, f"生产批次 {body.production_batch_id} 不存在")
+        if batch["product_id"] not in pb["applicable_product_ids"]:
+            raise HTTPException(409, {"error": "产品不匹配：该印刷批次不适用于待包装批次"
+                                               "所属产品",
+                                     "differences": [{
+                                         "path": "product_match",
+                                         "expected": pb["applicable_product_ids"],
+                                         "actual": batch["product_id"]}]})
+        if pb["expires_at"]:
+            # 以批次开工时刻核对失效；开工时刻缺失时按当前日期核对
+            reference_date = (batch.get("started_at") or utcnow())[:10]
+            if reference_date > pb["expires_at"][:10]:
+                raise HTTPException(409, {"error": "印刷批次已失效，不得贴用于新批次",
+                                         "differences": [{
+                                             "path": "print_batch.expires_at",
+                                             "expires_at": pb["expires_at"],
+                                             "reference_date": reference_date,
+                                             "batch_started_at": batch.get("started_at")}]})
+        if body.quantity > pb["remaining_quantity"]:
+            raise HTTPException(409, {"error": "领用数量超过印刷批次剩余数量",
+                                     "quantity": body.quantity,
+                                     "remaining_quantity": pb["remaining_quantity"],
+                                     "differences": [{"path": "remaining_quantity",
+                                                      "expected": f"<= {pb['remaining_quantity']}",
+                                                      "actual": body.quantity}]})
+        result = printing.evaluate_release(store, pb, batch, label)
+        if not result["ok"]:
+            raise HTTPException(409, {"error": "待包装批次当前分析与批准快照/印刷摘要"
+                                               "逐项对照不符，禁止放行",
+                                     "analysis_version": result["analysis_version"],
+                                     "differences": result["differences"]})
+        issued = printing.issue(store, pb, batch, body.quantity, body.idempotency_key)
+        return {**issued,
+                "print_batch": store.get_print_batch(print_batch_id)}
+
+    @app.post("/print-batches/{print_batch_id}/dispose", tags=["印刷标签批次"])
+    def dispose_print_batch(print_batch_id: str, body: PrintBatchDispose,
+                            store: Store = Depends(get_store)):
+        """冻结余量处置：可报废（scrap）或隔离（quarantine），须写明理由。"""
+        pb = _print_batch_or_404(print_batch_id, store)
+        if pb["status"] != "frozen":
+            raise HTTPException(409, f"仅冻结中的印刷批次余量可处置，当前状态 "
+                                    f"{pb['status']}")
+        if body.quantity > pb["remaining_quantity"]:
+            raise HTTPException(409, f"处置数量 {body.quantity} 超过剩余数量 "
+                                    f"{pb['remaining_quantity']}")
+        updated = store.create_disposition(print_batch_id, body.action,
+                                           body.quantity, body.reason)
+        return _print_batch_view(store, updated)
 
     # ------------------------------------------------------------- 报告
     @app.get("/labels/{label_id}/check-package", tags=["报告"])

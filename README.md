@@ -8,6 +8,7 @@
 - **问题检测**：资料缺口、别名混用、循环引用、无法展开的复合原料、“无某过敏原”宣称与资料的矛盾；
 - **生命周期**：草拟 → 复核 → 批准 → 撤回，未决矛盾阻止批准；
 - **影响传播**：配方/规格更新沿依赖图标记受影响产品；拭子结果补录沿返工影响链标记批次标签；批准记录只读并派生新修订；
+- **印刷批次领用放行**：印刷卷标按批准修订入库（规范化文案摘要），领用时核对标签仍 approved、无 stale、产品匹配、未失效、余量充足，并把待包装批次当前分析与批准快照/印刷摘要逐项对照；撤回、规格变化、阳性拭子冻结剩余卷标并列出处置批次；
 - **审核覆盖**：审核人可覆盖自动结论，但必须填写理由并关联输入证据；
 - **报告**：两版声明比较（增删 + 波及范围）、JSON 核对包、可打印审查单、请求样例。
 
@@ -17,7 +18,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（16 + 21 个批次追溯测试）
+python -m pytest tests/                        # 端到端测试（38 + 18 个印刷批次放行测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -98,7 +99,24 @@ swab:{swab_id}                                 拭子结果
 - 新规格版本 / 新配方 / 共线变更 → 沿依赖图找出引用该产品或原料的所有标签；
 - 草稿、复核中的标签标记 `stale`；已批准标签标记 `stale` 并**派生新修订**（草稿、重新分析）；
 - `PUT /swabs/{id}/result` 补录拭子定量结果时自动处理：草稿/复核中标签立即重新分析（阴性补录可消解“结果待出”的开放路径）；结果超限且采样点/过敏原属程序验证对象时，沿返工影响链传播，已批准标签标记 `stale` 并派生新修订，调用方无需手工触发；
-- `approvals` 表只插不改；批准快照永久保留文案、推导、发现项，以及**逐批次追溯采用的清洁程序版本、清洁记录与拭子结果**——后续补录不改写已冻结快照。
+- `approvals` 表只插不改；批准快照永久保留文案、推导、发现项，以及**逐批次追溯采用的清洁程序版本、清洁记录与拭子结果**——后续补录不再改写已冻结快照。
+
+## 印刷标签批次领用放行
+
+现场若只核对产品名，换版或阳性拭子补录后旧版卷标仍可能被贴上新产品批次。印刷卷标按“印刷批次”单独管理，放行是批准快照与待包装批次当前分析之间的最后核对：
+
+1. `POST /print-batches` 入库登记：关联**已批准**标签修订；服务端按批准文案生成规范化摘要（过敏原大小写归一、排序去重，配料表压缩空白），请求自带 `copy` 摘要时必须一致，否则 422；登记数量、入库/失效时刻与适用产品（缺省仅标签所属产品，且必须包含它）。
+2. `POST /print-batches/{id}/issue` 领用放行，门禁依次核对：
+   - 标签修订仍为 `approved`、无 `stale` 标记（撤回/规格变化/阳性传播后即失效）；
+   - 印刷批次 `available`、未失效（按批次开工时刻，缺省按当前日期）、余量充足；
+   - 待包装批次所属产品在适用产品清单内；
+   - 待包装批次**当前重新推导**的应声明/交叉接触项与批准快照逐项一致，印刷摘要与批准文案逐项一致，且没有新增开放 blocker（阳性拭子等硬证据失败）。
+
+   任一不符返回 409，`detail.differences` 给出差异路径（如 `derived.may_contain.extra[peanut]`、`print_summary.declared_allergens.missing[milk]`、`label.stale`、`print_batch.expires_at`、`product_match`、`remaining_quantity`），不写领用记录。
+3. 领用记录绑定生产批次、实际数量与**幂等键**：同键重放复用原领用结果（含原 `issuance_id`/分析版本，不重复扣减）；同键内容冲突返回 409——已领用数量只增不减，没有倒扣入口；余量归零自动结案。
+4. 标签撤回、规格/配方变化或阳性拭子补录触发影响传播时，自动冻结该修订下仍有余量的印刷批次（`frozen`，附冻结原因），并在响应中列出**已领用它的生产批次**及各自领用数量/分析版本，进入处置评估。
+5. `POST /print-batches/{id}/dispose` 处置冻结余量：`scrap`（报废）或 `quarantine`（隔离），必须写明理由；部分处置后仍冻结，余量归零结案。
+6. 每次放行记录冻结采用的标签修订、分析版本（当前推导结构的哈希 `ana-…`）、数量变化；核对包的 `print_control` 汇总入库/领用/处置数量、冻结原因与每条领用；审查单含印刷批次小节；事件日志记录 `print_batch_registered / issued / frozen / disposed`。
 
 ## 主要接口
 
@@ -119,7 +137,9 @@ swab:{swab_id}                                 拭子结果
 | POST | `/labels`（可带 `batch_id`）· `/submit` · `/approve` · `/withdraw` | 生命周期（批次绑定持久化） |
 | PUT | `/labels/{id}/copy` · POST `/labels/{id}/reanalyze?batch_id=` | 修改文案 / 重新分析（可改绑批次） |
 | POST | `/labels/{id}/findings/{fid}/override` | 覆盖自动结论 |
-| GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引） |
+| POST | `/print-batches` · `/{id}/issue` · `/{id}/dispose` | 印刷批次入库（批准文案摘要）/ 领用放行（幂等，逐项对照）/ 冻结余量报废或隔离 |
+| GET | `/print-batches/{id}` | 印刷批次详情（领用与处置流水） |
+| GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引与印刷放行控制） |
 | GET | `/labels/{id}/review-sheet` | 可打印审查单（HTML，含追溯小节） |
 | GET | `/samples/compound-coline` | 复合原料 + 共线冲突请求样例 |
 | GET | `/events` | 审计事件日志 |
@@ -136,9 +156,11 @@ label_audit/
   models.py   Pydantic 请求校验
   engine.py   规则引擎：展开、推导、检测、影响、比较
   trace.py    逐批次追溯：路径开闭、返工链、批准快照证据
+  printing.py 印刷批次：文案规范化摘要、放行逐项对照、影响冻结
   db.py       SQLite 持久层（approvals 只读）
   report.py   JSON 核对包 / 可打印审查单
 samples/compound_coline.json   请求样例
 tests/test_api.py              16 个端到端测试
 tests/test_batch_trace.py      21 个逐批追溯/补录传播回归测试
+tests/test_print_batches.py    18 个印刷批次领用放行/冻结/处置测试
 ```

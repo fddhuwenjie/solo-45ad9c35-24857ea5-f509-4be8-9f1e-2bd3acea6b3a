@@ -390,7 +390,12 @@ def impacted_products(store, ingredient_ids) -> set[str]:
 
 
 def apply_impact(store, product_ids, reason: str) -> list[dict]:
-    """标记受影响标签：草稿/复核中置 stale；已批准的派生新修订（批准记录保持只读）。"""
+    """标记受影响标签：草稿/复核中置 stale；已批准的派生新修订（批准记录保持只读）。
+
+    已批准标签下仍有余量的印刷批次同步冻结，并汇总已领用它们的生产批次进入处置。
+    """
+    from .printing import freeze_for_label  # 延迟导入避免循环依赖
+
     actions = []
     for pid in sorted(product_ids):
         for label in store.labels_for_product(pid):
@@ -400,10 +405,12 @@ def apply_impact(store, product_ids, reason: str) -> list[dict]:
                                 "revision": label["revision"], "action": "marked_stale"})
             elif label["status"] == "approved":
                 store.set_stale(label["id"], True)
+                print_freeze = freeze_for_label(store, label["id"], reason=reason)
                 new_label = store.create_label(pid, label["copy"], parent_id=label["id"])
                 analyze_label(store, new_label["id"])
                 actions.append({"label_id": label["id"], "product_id": pid,
-                                "revision": label["revision"], "action": "marked_stale"})
+                                "revision": label["revision"], "action": "marked_stale",
+                                "print_freeze": print_freeze})
                 actions.append({"label_id": new_label["id"], "product_id": pid,
                                 "revision": new_label["revision"],
                                 "action": "derived_new_revision"})
@@ -430,9 +437,12 @@ def apply_batch_impact(store, batch_ids, reason: str, positive: bool = True) -> 
 
     - 草稿/复核中标签：重新分析（同一绑定批次），开放路径立即重开/消解；
     - 已批准标签（仅阳性补录）：冻结的批准记录不动，标记 stale 并派生新修订
-      （草稿、重新分析）；阴性补录不影响已批准标签；
+      （草稿、重新分析）；该修订下仍有余量的印刷批次同步冻结；阴性补录不影响
+      已批准标签与印刷批次；
     - 已撤回标签：仅记录，不派生。
     """
+    from .printing import freeze_for_label  # 延迟导入避免循环依赖
+
     actions = []
     for bid in sorted(batch_ids):
         for label_id in store.labels_for_batch(bid):
@@ -447,13 +457,15 @@ def apply_batch_impact(store, batch_ids, reason: str, positive: bool = True) -> 
                                 "action": "reanalyzed"})
             elif label["status"] == "approved" and positive:
                 store.set_stale(label_id, True)
+                print_freeze = freeze_for_label(store, label_id, reason=reason)
                 new_label = store.create_label(label["product_id"], label["copy"],
                                                parent_id=label["id"])
                 store.set_label_batch(new_label["id"], bid)
                 analyze_label(store, new_label["id"], batch_id=bid)
                 actions.append({"batch_id": bid, "label_id": label_id,
                                 "product_id": label["product_id"],
-                                "revision": label["revision"], "action": "marked_stale"})
+                                "revision": label["revision"], "action": "marked_stale",
+                                "print_freeze": print_freeze})
                 actions.append({"batch_id": bid, "label_id": new_label["id"],
                                 "product_id": label["product_id"],
                                 "revision": new_label["revision"],

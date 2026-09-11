@@ -189,3 +189,41 @@ class OverrideRequest(BaseModel):
     reviewer: str = Field(min_length=1)
     reason: str = Field(min_length=1)
     evidence_refs: list[str] = Field(min_length=1)
+
+
+# ------------------------------------------------------------- 印刷标签批次
+class PrintBatchCreate(BaseModel):
+    """印刷标签批次入库登记。
+
+    copy_summary 可由送印方自报以便核对；缺省时服务端按批准文案规范化生成。
+    applicable_product_ids 为该批卷标允许粘贴的产品；缺省仅标签所属产品。
+    """
+
+    print_batch_id: str = Field(min_length=1)
+    label_id: str = Field(min_length=1, description="关联的已批准标签修订")
+    quantity_received: int = Field(gt=0, description="入库数量（张/枚）")
+    received_at: Optional[str] = Field(default=None, description="入库时刻 ISO8601")
+    expires_at: Optional[str] = Field(default=None, description="失效时刻/日期 ISO8601")
+    applicable_product_ids: list[str] = Field(
+        default_factory=list, description="适用产品；缺省仅标签所属产品")
+    copy_summary: Optional[LabelCopy] = Field(
+        default=None, alias="copy",
+        description="送印文案摘要；提供时必须与批准文案规范化结果一致，否则 422")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PrintBatchIssue(BaseModel):
+    """领用放行：把印刷卷标绑定到待包装生产批次。"""
+
+    production_batch_id: str = Field(min_length=1)
+    quantity: int = Field(gt=0, description="实际领用数量，不得超过剩余数量")
+    idempotency_key: str = Field(min_length=1, description="幂等键；重复请求复用原结果")
+
+
+class PrintBatchDispose(BaseModel):
+    """冻结余量处置：报废或隔离，必须写明理由。"""
+
+    action: Literal["scrap", "quarantine"]
+    quantity: int = Field(gt=0, description="处置数量，不得超过剩余数量")
+    reason: str = Field(min_length=1)

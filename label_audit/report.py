@@ -58,6 +58,34 @@ def build_check_package(store, label_id: str) -> dict:
             "items": recipe["items"],
         })
 
+    # 印刷标签批次控制：放行采用的标签修订、分析版本、数量变化与冻结原因
+    print_batches = []
+    for pb in store.print_batches_for_label(label_id):
+        print_batches.append({
+            "print_batch_id": pb["print_batch_id"],
+            "status": pb["status"],
+            "copy_summary": pb["copy_summary"],
+            "quantity_received": pb["quantity_received"],
+            "issued_quantity": pb["issued_quantity"],
+            "disposed_quantity": pb["disposed_quantity"],
+            "remaining_quantity": pb["remaining_quantity"],
+            "received_at": pb["received_at"],
+            "expires_at": pb["expires_at"],
+            "applicable_product_ids": pb["applicable_product_ids"],
+            "frozen_reason": pb["frozen_reason"],
+            "frozen_at": pb["frozen_at"],
+            "issuances": [
+                {"issuance_id": i["issuance_id"],
+                 "production_batch_id": i["production_batch_id"],
+                 "quantity": i["quantity"],
+                 "label_revision": i["label_revision"],
+                 "analysis_version": i["analysis_version"],
+                 "analysis_snapshot": i["analysis_snapshot"],
+                 "issued_at": i["created_at"]}
+                for i in store.issuances_for_print_batch(pb["print_batch_id"])],
+            "dispositions": store.dispositions_for_print_batch(pb["print_batch_id"]),
+        })
+
     return {
         "package_type": "label_audit_check_package",
         "generated_at": utcnow(),
@@ -70,6 +98,15 @@ def build_check_package(store, label_id: str) -> dict:
         "approvals": approvals,
         "batch_id": batch_id,
         "batch_trace": batch_evidence["trace"] if batch_evidence else None,
+        "print_control": {
+            "label_id": label_id,
+            "print_batches": print_batches,
+            "total_received": sum(p["quantity_received"] for p in print_batches),
+            "total_issued": sum(p["issued_quantity"] for p in print_batches),
+            "total_disposed": sum(p["disposed_quantity"] for p in print_batches),
+            "frozen": [p["print_batch_id"] for p in print_batches
+                       if p["status"] == "frozen"],
+        },
         "evidence_index": evidence_index,
     }
 
@@ -139,6 +176,32 @@ def build_review_sheet(store, label_id: str) -> str:
             ov_text = f"{ov['reviewer']}：{ov['reason']}（证据：{', '.join(ov['evidence_refs'])}）"
         return (f["kind"], f["severity"], f["status"], f["message"], ov_text)
 
+    def print_section() -> str:
+        rows = store.print_batches_for_label(label_id)
+        if not rows:
+            return "<table><tr><td class='empty'>（无登记印刷批次）</td></tr></table>"
+        body = ""
+        for pb in rows:
+            issuances = store.issuances_for_print_batch(pb["print_batch_id"])
+            issued = ", ".join(
+                f"{i['production_batch_id']}×{i['quantity']}"
+                f"（{i['analysis_version']}）" for i in issuances) or "—"
+            freeze = f"；冻结原因：{_esc(pb['frozen_reason'])}" if pb["frozen_reason"] else ""
+            body += (
+                f"<tr><td>{_esc(pb['print_batch_id'])}</td>"
+                f"<td>{_esc(pb['status'])}{freeze}</td>"
+                f"<td>{pb['quantity_received']}</td>"
+                f"<td>{pb['issued_quantity']}</td>"
+                f"<td>{pb['disposed_quantity']}</td>"
+                f"<td>{pb['remaining_quantity']}</td>"
+                f"<td>{_esc(', '.join(pb['applicable_product_ids']))}</td>"
+                f"<td>{_esc(pb['expires_at'] or '—')}</td>"
+                f"<td>{_esc(issued)}</td></tr>")
+        return ("<table><tr><th>印刷批号</th><th>状态</th><th>入库</th>"
+                "<th>已领用</th><th>已处置</th><th>剩余</th><th>适用产品</th>"
+                "<th>失效时刻</th><th>领用生产批次（分析版本）</th></tr>"
+                f"{body}</table>")
+
     sheet = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>标签审查单 - {_esc(product['name'])} 第{label['revision']}版</title>
@@ -193,7 +256,10 @@ def build_review_sheet(store, label_id: str) -> str:
 {_rows(approvals, [lambda a: a['id'], lambda a: a['approved_by'], lambda a: a['approved_at']])}
 </table>
 
-<h2>七、签字</h2>
+<h2>七、印刷标签批次领用放行</h2>
+{print_section()}
+
+<h2>八、签字</h2>
 <table class="sign"><tr><th>环节</th><th>签字</th><th>日期</th><th>备注</th></tr>
 {''.join(f"<tr><td>{s}</td><td></td><td></td><td></td></tr>" for s in ('草拟', '复核', '批准', '撤回'))}
 </table>

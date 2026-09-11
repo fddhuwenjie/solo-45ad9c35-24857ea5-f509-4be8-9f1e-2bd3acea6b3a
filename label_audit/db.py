@@ -143,10 +143,49 @@ CREATE TABLE IF NOT EXISTS label_batches (
     label_id TEXT PRIMARY KEY,
     batch_id TEXT NOT NULL
 );
+-- 印刷标签批次：按已批准标签修订印刷的实物卷标入库与领用
+CREATE TABLE IF NOT EXISTS print_batches (
+    print_batch_id TEXT PRIMARY KEY,
+    label_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    applicable_product_ids TEXT NOT NULL DEFAULT '[]',
+    copy_summary TEXT NOT NULL,
+    quantity_received INTEGER NOT NULL,
+    received_at TEXT,
+    expires_at TEXT,
+    status TEXT NOT NULL DEFAULT 'available',
+    frozen_reason TEXT,
+    frozen_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS print_issuances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issuance_id TEXT NOT NULL UNIQUE,
+    print_batch_id TEXT NOT NULL,
+    production_batch_id TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    label_id TEXT NOT NULL,
+    label_revision INTEGER NOT NULL,
+    analysis_version TEXT NOT NULL,
+    analysis_snapshot TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS print_dispositions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    print_batch_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 # 标签生命周期：draft -> in_review -> approved -> withdrawn
 LABEL_STATUSES = ("draft", "in_review", "approved", "withdrawn")
+# 印刷批次状态：available 可领用 -> frozen（影响传播冻结剩余）/ closed（余量归零）
+PRINT_BATCH_STATUSES = ("available", "frozen", "closed")
+PRINT_DISPOSITION_ACTIONS = ("scrap", "quarantine")
 
 
 def utcnow() -> str:
@@ -740,4 +779,180 @@ class Store:
             "approved_by": r["approved_by"],
             "approved_at": r["approved_at"],
             "snapshot": _loads(r["snapshot"], {}),
+        }
+
+    # ------------------------------------------------------------------ 印刷标签批次
+    def create_print_batch(self, print_batch_id: str, label_id: str, product_id: str,
+                           applicable_product_ids: list[str], copy_summary: dict,
+                           quantity_received: int, received_at: str | None,
+                           expires_at: str | None) -> dict:
+        self._exec(
+            "INSERT INTO print_batches (print_batch_id, label_id, product_id,"
+            " applicable_product_ids, copy_summary, quantity_received, received_at,"
+            " expires_at, status, created_at) VALUES (?,?,?,?,?,?,?,?,'available',?)",
+            (print_batch_id, label_id, product_id,
+             json.dumps(applicable_product_ids, ensure_ascii=False),
+             json.dumps(copy_summary, ensure_ascii=False),
+             quantity_received, received_at, expires_at, utcnow()),
+        )
+        self.log_event("print_batch_registered", {
+            "print_batch_id": print_batch_id, "label_id": label_id,
+            "product_id": product_id, "applicable_product_ids": applicable_product_ids,
+            "quantity_received": quantity_received,
+            "received_at": received_at, "expires_at": expires_at,
+            "copy_summary": copy_summary})
+        return self.get_print_batch(print_batch_id)
+
+    def get_print_batch(self, print_batch_id: str) -> dict | None:
+        r = self._one("SELECT * FROM print_batches WHERE print_batch_id = ?",
+                      (print_batch_id,))
+        return self._decode_print_batch(r) if r else None
+
+    def print_batches_for_label(self, label_id: str) -> list[dict]:
+        return [
+            self._decode_print_batch(r)
+            for r in self._q("SELECT * FROM print_batches WHERE label_id = ? ORDER BY rowid",
+                             (label_id,))
+        ]
+
+    def issued_quantity(self, print_batch_id: str) -> int:
+        r = self._one(
+            "SELECT COALESCE(SUM(quantity),0) AS s FROM print_issuances"
+            " WHERE print_batch_id = ?",
+            (print_batch_id,))
+        return int(r["s"])
+
+    def disposed_quantity(self, print_batch_id: str) -> int:
+        r = self._one(
+            "SELECT COALESCE(SUM(quantity),0) AS s FROM print_dispositions"
+            " WHERE print_batch_id = ?",
+            (print_batch_id,))
+        return int(r["s"])
+
+    def issuances_for_print_batch(self, print_batch_id: str) -> list[dict]:
+        return [
+            self._decode_issuance(r)
+            for r in self._q("SELECT * FROM print_issuances WHERE print_batch_id = ?"
+                            " ORDER BY id", (print_batch_id,))
+        ]
+
+    def issuance_by_idempotency_key(self, key: str) -> dict | None:
+        r = self._one("SELECT * FROM print_issuances WHERE idempotency_key = ?", (key,))
+        return self._decode_issuance(r) if r else None
+
+    def create_issuance(self, issuance_id: str, print_batch_id: str,
+                        production_batch_id: str, quantity: int, idempotency_key: str,
+                        label_id: str, label_revision: int, analysis_version: str,
+                        analysis_snapshot: dict) -> dict:
+        self._exec(
+            "INSERT INTO print_issuances (issuance_id, print_batch_id, production_batch_id,"
+            " quantity, idempotency_key, label_id, label_revision, analysis_version,"
+            " analysis_snapshot, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (issuance_id, print_batch_id, production_batch_id, quantity, idempotency_key,
+             label_id, label_revision, analysis_version,
+             json.dumps(analysis_snapshot, ensure_ascii=False), utcnow()),
+        )
+        # 余量归零：剩余印刷批次不可倒扣，自动结案，不再接受领用/处置
+        pb = self.get_print_batch(print_batch_id)
+        if pb and pb["remaining_quantity"] == 0 and pb["status"] == "available":
+            self._exec("UPDATE print_batches SET status = 'closed' WHERE print_batch_id = ?",
+                       (print_batch_id,))
+        self.log_event("print_batch_issued", {
+            "issuance_id": issuance_id, "print_batch_id": print_batch_id,
+            "production_batch_id": production_batch_id, "quantity": quantity,
+            "idempotency_key": idempotency_key, "label_id": label_id,
+            "label_revision": label_revision, "analysis_version": analysis_version})
+        return self.get_issuance(issuance_id)
+
+    def get_issuance(self, issuance_id: str) -> dict | None:
+        r = self._one("SELECT * FROM print_issuances WHERE issuance_id = ?", (issuance_id,))
+        return self._decode_issuance(r) if r else None
+
+    def freeze_print_batch(self, print_batch_id: str, reason: str) -> None:
+        """冻结剩余印刷批次；已结案（余量归零）的批次不再改变状态。"""
+        pb = self.get_print_batch(print_batch_id)
+        if pb is None or pb["status"] == "closed":
+            return
+        self._exec(
+            "UPDATE print_batches SET status = 'frozen', frozen_reason = ?, frozen_at = ?"
+            " WHERE print_batch_id = ?",
+            (reason, utcnow(), print_batch_id))
+        self.log_event("print_batch_frozen",
+                       {"print_batch_id": print_batch_id, "reason": reason})
+
+    def freeze_available_print_batches_for_label(self, label_id: str, reason: str) -> list[dict]:
+        """冻结某标签修订下所有仍可领用的印刷批次，返回被冻结批次（含处置清单依据）。"""
+        frozen = []
+        for pb in self.print_batches_for_label(label_id):
+            if pb["status"] != "available" or pb["remaining_quantity"] <= 0:
+                continue
+            self.freeze_print_batch(pb["print_batch_id"], reason)
+            frozen.append(self.get_print_batch(pb["print_batch_id"]))
+        return frozen
+
+    def create_disposition(self, print_batch_id: str, action: str, quantity: int,
+                           reason: str) -> dict:
+        self._exec(
+            "INSERT INTO print_dispositions (print_batch_id, action, quantity, reason, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (print_batch_id, action, quantity, reason, utcnow()),
+        )
+        pb = self.get_print_batch(print_batch_id)
+        if pb and pb["remaining_quantity"] == 0:
+            self._exec("UPDATE print_batches SET status = 'closed' WHERE print_batch_id = ?",
+                       (print_batch_id,))
+        self.log_event("print_batch_disposed", {
+            "print_batch_id": print_batch_id, "action": action,
+            "quantity": quantity, "reason": reason})
+        return self.get_print_batch(print_batch_id)
+
+    def dispositions_for_print_batch(self, print_batch_id: str) -> list[dict]:
+        return [
+            {"id": r["id"], "action": r["action"], "quantity": r["quantity"],
+             "reason": r["reason"], "created_at": r["created_at"]}
+            for r in self._q("SELECT * FROM print_dispositions WHERE print_batch_id = ?"
+                            " ORDER BY id", (print_batch_id,))
+        ]
+
+    @staticmethod
+    def _decode_issuance(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "issuance_id": r["issuance_id"],
+            "print_batch_id": r["print_batch_id"],
+            "production_batch_id": r["production_batch_id"],
+            "quantity": r["quantity"],
+            "idempotency_key": r["idempotency_key"],
+            "label_id": r["label_id"],
+            "label_revision": r["label_revision"],
+            "analysis_version": r["analysis_version"],
+            "analysis_snapshot": _loads(r["analysis_snapshot"], {}),
+            "created_at": r["created_at"],
+        }
+
+    def _decode_print_batch(self, r: sqlite3.Row) -> dict:
+        issued = self.issued_quantity(r["print_batch_id"])
+        disposed = self.disposed_quantity(r["print_batch_id"])
+        received = r["quantity_received"]
+        status = r["status"]
+        remaining = received - issued - disposed
+        # 余量因领用归零而状态未及更新时，对外呈现为 closed（数据层兜底）
+        if remaining == 0 and status == "available":
+            status = "closed"
+        return {
+            "print_batch_id": r["print_batch_id"],
+            "label_id": r["label_id"],
+            "product_id": r["product_id"],
+            "applicable_product_ids": _loads(r["applicable_product_ids"], []),
+            "copy_summary": _loads(r["copy_summary"], {}),
+            "quantity_received": received,
+            "issued_quantity": issued,
+            "disposed_quantity": disposed,
+            "remaining_quantity": remaining,
+            "received_at": r["received_at"],
+            "expires_at": r["expires_at"],
+            "status": status,
+            "frozen_reason": r["frozen_reason"],
+            "frozen_at": r["frozen_at"],
+            "created_at": r["created_at"],
         }
