@@ -18,7 +18,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（38 + 18 个印刷批次放行测试）
+python -m pytest tests/                        # 端到端测试（38 + 21 个印刷批次放行测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -110,13 +110,14 @@ swab:{swab_id}                                 拭子结果
    - 标签修订仍为 `approved`、无 `stale` 标记（撤回/规格变化/阳性传播后即失效）；
    - 印刷批次 `available`、未失效（按批次开工时刻，缺省按当前日期）、余量充足；
    - 待包装批次所属产品在适用产品清单内；
-   - 待包装批次**当前重新推导**的应声明/交叉接触项与批准快照逐项一致，印刷摘要与批准文案逐项一致，且没有新增开放 blocker（阳性拭子等硬证据失败）。
+   - 待包装批次**所属产品**（跨产品领用时按该产品当前配方/规格，而非标签修订所属产品）**当前重新推导**的应声明/交叉接触项与批准快照逐项一致，印刷摘要与批准文案逐项一致，且没有新增开放 blocker（阳性拭子等硬证据失败）。
 
    任一不符返回 409，`detail.differences` 给出差异路径（如 `derived.may_contain.extra[peanut]`、`print_summary.declared_allergens.missing[milk]`、`label.stale`、`print_batch.expires_at`、`product_match`、`remaining_quantity`），不写领用记录。
 3. 领用记录绑定生产批次、实际数量与**幂等键**：同键重放复用原领用结果（含原 `issuance_id`/分析版本，不重复扣减）；同键内容冲突返回 409——已领用数量只增不减，没有倒扣入口；余量归零自动结案。
 4. 标签撤回、规格/配方变化或阳性拭子补录触发影响传播时，自动冻结该修订下仍有余量的印刷批次（`frozen`，附冻结原因），并在响应中列出**已领用它的生产批次**及各自领用数量/分析版本，进入处置评估。
 5. `POST /print-batches/{id}/dispose` 处置冻结余量：`scrap`（报废）或 `quarantine`（隔离），必须写明理由；部分处置后仍冻结，余量归零结案。
-6. 每次放行记录冻结采用的标签修订、分析版本（当前推导结构的哈希 `ana-…`）、数量变化；核对包的 `print_control` 汇总入库/领用/处置数量、冻结原因与每条领用；审查单含印刷批次小节；事件日志记录 `print_batch_registered / issued / frozen / disposed`。
+6. 每次放行记录冻结采用的标签修订、分析版本（当前推导结构含待包装批次所属产品的哈希 `ana-…`）、数量变化；核对包的 `print_control` 汇总入库/领用/处置数量、冻结原因与每条领用；审查单含印刷批次小节；事件日志记录 `print_batch_registered / issued / frozen / disposed`。
+7. stale 标记不可被“重新分析”清除：仅草稿/复核中标签能凭重新分析消解 stale；已批准/已撤回修订的 stale 只能保留——`/reanalyze`、`/analysis`、审查单生成（内部重跑分析）或新登记印刷批次都不能让它恢复可领用。
 
 ## 主要接口
 
@@ -162,5 +163,5 @@ label_audit/
 samples/compound_coline.json   请求样例
 tests/test_api.py              16 个端到端测试
 tests/test_batch_trace.py      21 个逐批追溯/补录传播回归测试
-tests/test_print_batches.py    18 个印刷批次领用放行/冻结/处置测试
+tests/test_print_batches.py    21 个印刷批次领用放行/冻结/处置回归测试
 ```

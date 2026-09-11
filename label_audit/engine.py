@@ -357,7 +357,10 @@ def analyze_label(store, label_id: str, batch_id: str | None = None) -> dict:
         findings += trace_findings(store, batch_id, label["copy"])
     store.sync_findings(label_id, findings)
     store.set_label_derived(label_id, derived)
-    store.set_stale(label_id, False)
+    # 仅草稿/复核中可凭重新分析消解 stale；已批准/已撤回修订不可变，其 stale
+    # 标记只能保留——审查单生成、分析查询、新印刷批次登记都不得把它清除。
+    if label["status"] in ("draft", "in_review"):
+        store.set_stale(label_id, False)
     trace = trace_batch(store, batch_id) if batch_id else None
     return {
         "label_id": label_id,

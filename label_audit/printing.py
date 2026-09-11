@@ -3,6 +3,8 @@
 放行是“批准快照”与“待包装批次当前分析”之间的最后一道核对：仅核对产品名
 不足以防止旧版卷标混入，因此领用端点逐项比对
 
+  0. 待包装批次**所属产品**（跨产品领用时不是标签修订所属产品）的当前配方/
+     规格推导出的声明；
   1. 印刷摘要（入库时由批准文案规范化）与批准快照文案；
   2. 待包装批次当前推导出的应声明/交叉接触项与批准快照；
   3. 当前分析重新计算后新增的开放 blocker（阳性拭子等硬证据失败）；
@@ -46,21 +48,27 @@ def canonical_copy_summary(copy: dict) -> dict:
     }
 
 
-def current_basis(store, label: dict, production_batch_id: str) -> dict:
-    """对待包装批次当前资料重新推导（不改动标签的落库分析结果）。"""
-    exp = expand_recipe(store, label["product_id"])
-    derived = derive_declarations(store, label["product_id"], exp,
-                                  batch_id=production_batch_id)
+def current_basis(store, label: dict, production_batch: dict) -> dict:
+    """对待包装批次当前资料重新推导（不改动标签的落库分析结果）。
+
+    跨产品领用时必须按**待包装批次所属产品**的当前配方/规格展开，而不是标签
+    修订所属产品——同一卷标适用多个产品时，各产品的应声明项可能不同。
+    """
+    product_id = production_batch["product_id"]
+    exp = expand_recipe(store, product_id)
+    derived = derive_declarations(store, product_id, exp,
+                                  batch_id=production_batch["batch_id"])
     findings = list(exp.findings) + compare_with_copy(label["copy"], derived)
-    findings += trace_findings(store, production_batch_id, label["copy"])
+    findings += trace_findings(store, production_batch["batch_id"], label["copy"])
     return {"derived": derived, "findings": findings,
             "graph": [n.as_dict() for n in exp.nodes]}
 
 
-def analysis_version(basis: dict, label: dict, production_batch_id: str) -> str:
+def analysis_version(basis: dict, label: dict, production_batch: dict) -> str:
     """放行采用的分析版本：当前推导结构（含证据路径）的稳定哈希。"""
     payload = {
-        "batch_id": production_batch_id,
+        "product_id": production_batch["product_id"],
+        "batch_id": production_batch["batch_id"],
         "derived": basis["derived"],
         "copy_revision": label["revision"],
     }
@@ -151,7 +159,7 @@ def evaluate_release(store, print_batch: dict, production_batch: dict,
     "analysis_version": ...}；ok 为 False 时差异路径逐项给出。"""
     approvals = store.approvals_for_label(label["id"])
     snapshot = approvals[-1]["snapshot"] if approvals else {}
-    basis = current_basis(store, label, production_batch["batch_id"])
+    basis = current_basis(store, label, production_batch)
     diffs: list[dict] = []
     diffs += _summary_diff(print_batch["copy_summary"],
                            canonical_copy_summary(snapshot.get("copy") or {}))
@@ -159,7 +167,7 @@ def evaluate_release(store, print_batch: dict, production_batch: dict,
     diffs += _fresh_blocker_diffs(basis, snapshot)
     return {"ok": not diffs, "differences": diffs, "basis": basis,
             "analysis_version": analysis_version(
-                basis, label, production_batch["batch_id"]),
+                basis, label, production_batch),
             "approved_snapshot": snapshot}
 
 

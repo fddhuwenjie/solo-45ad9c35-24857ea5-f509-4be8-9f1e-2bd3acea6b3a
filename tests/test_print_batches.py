@@ -448,3 +448,114 @@ def test_event_log_records_print_lifecycle(client):
     for k in ("print_batch_registered", "print_batch_issued",
               "print_batch_frozen", "print_batch_disposed"):
         assert k in kinds
+
+
+# -------------------------------------------------------------- 回归：跨产品按批次所属产品推导
+def test_cross_product_issue_derives_from_batch_product_recipe(client):
+    """跨产品领用必须按待包装批次所属产品的当前配方推导，而非标签所属产品。
+
+    P 批准快照：required={wheat}；P2 的配方需要 milk（无 milk 供应商声明 ->
+    视为资料缺口，同时快照 milk 缺失）。即使卷标适用清单包含 P2，放行也必须
+    409 并给出差异路径，且不写领用记录、不扣减库存。
+    """
+    lid = setup_world(client)
+    # P2：含乳制品（声明 present）的配方，独立产线无共线噪声
+    client.post("/ingredients", json={"id": "MILK", "name": "全脂乳粉"})
+    client.post("/ingredients/MILK/versions", json={
+        "version": "v1",
+        "supplier_declarations": [{"allergen": "milk", "status": "present"}]})
+    client.post("/lines", json={"id": "L2", "name": "2号线",
+                                "allergens_handled": []})
+    client.post("/products", json={"id": "P2", "name": "奶味饼干"})
+    client.post("/products/P2/recipes", json={
+        "version": "v1",
+        "items": [{"ingredient_ref": "MILK", "version": "v1", "percentage": 100}]})
+    client.post("/batches", json={
+        "batch_id": "BM", "product_id": "P2", "line_id": "L2", "sequence": 1,
+        "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    register_print_batch(client, lid, pb_id="PBX",
+                         applicable_product_ids=["P", "P2"])
+    r = issue(client, "PBX", "k-cross", batch="BM")
+    assert r.status_code == 409
+    paths = {d["path"] for d in r.json()["detail"]["differences"]}
+    # P2 当前分析多出 milk 应声明项；批准快照（P/wheat）没有
+    assert "derived.required.extra[milk]" in paths
+    # 放行失败不扣减库存、不留领用流水
+    pb = client.get("/print-batches/PBX").json()
+    assert pb["issued_quantity"] == 0 and pb["remaining_quantity"] == 1000
+    assert pb["issuances"] == []
+    # 同一卷标贴回配方兼容的 P/B2 仍可正常放行（门禁不是按产品名一刀切）
+    ok = issue(client, "PBX", "k-ok", batch="B2")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["issuance"]["quantity"] == 200
+
+
+def test_cross_product_issue_matching_derivation_succeeds(client):
+    """跨产品但配方推导一致时可放行；分析版本应带待包装批次所属产品。"""
+    lid = setup_world(client)
+    client.post("/lines", json={"id": "L2", "name": "2号线",
+                                "allergens_handled": []})
+    client.post("/products", json={"id": "P3", "name": "原味饼干"})
+    client.post("/products/P3/recipes", json={
+        "version": "v1",
+        "items": [{"ingredient_ref": "FLOUR", "version": "v1", "percentage": 100}]})
+    client.post("/batches", json={
+        "batch_id": "BW", "product_id": "P3", "line_id": "L2", "sequence": 1,
+        "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    register_print_batch(client, lid, pb_id="PBW",
+                         applicable_product_ids=["P", "P3"])
+    r = issue(client, "PBW", "k-w", batch="BW")
+    assert r.status_code == 200, r.text
+    # 分析版本对 P/B2 与 P3/BW 必须不同（产品维度进入哈希）
+    r2 = issue(client, "PBW", "k-p", batch="B2")
+    assert r2.status_code == 200, r2.text
+    assert r.json()["issuance"]["analysis_version"] != \
+        r2.json()["issuance"]["analysis_version"]
+
+
+# -------------------------------------------------------------- 回归：stale 不可被分析/审查单清除
+def test_stale_approved_revision_survives_reanalysis_review_sheet_and_registration(client):
+    """规格变化把已批准修订标 stale 后：重新分析、生成审查单、再登记印刷批次
+
+    都不得清除 stale；该修订下的任何领用始终 409。
+    """
+    lid = setup_world(client)
+    register_print_batch(client, lid)
+    issue(client, "PB1", "k1", qty=100)
+    # 规格变化：小麦粉新规格多出 milk -> rev1 标 stale 并派生新修订
+    r = client.post("/ingredients/FLOUR/versions", json={
+        "version": "v2",
+        "supplier_declarations": [
+            {"allergen": "wheat", "status": "present"},
+            {"allergen": "milk", "status": "present"}]})
+    assert any(a["action"] == "marked_stale" for a in r.json()["actions"])
+
+    def assert_stale():
+        view = client.get(f"/labels/{lid}").json()
+        assert view["status"] == "approved" and view["stale"] is True
+
+    assert_stale()
+    # 重新分析（显式端点）不得清除已批准修订的 stale
+    assert client.post(f"/labels/{lid}/reanalyze").status_code == 200
+    assert_stale()
+    # 分析查询（GET /analysis 内部会重跑分析）同样不得清除
+    assert client.get(f"/labels/{lid}/analysis").status_code == 200
+    assert_stale()
+    # 生成审查单也会刷新分析——stale 仍保留，且审查单明确标注“资料已过期”
+    sheet = client.get(f"/labels/{lid}/review-sheet")
+    assert sheet.status_code == 200 and "资料已过期" in sheet.text
+    assert_stale()
+    # stale 后新登记的印刷批次同样不能领用（批准修订仍为 stale）
+    register_print_batch(client, lid, pb_id="PB2")
+    r = issue(client, "PB2", "k2")
+    assert r.status_code == 409
+    assert [d["path"] for d in r.json()["detail"]["differences"]] == ["label.stale"]
+    # 已登记的旧批次也仍被冻结（规格变化时自动冻结），领用同样拒绝
+    r = issue(client, "PB1", "k3")
+    assert r.status_code == 409
+    # 库存维持冻结时的值，无新增扣减
+    pb = client.get("/print-batches/PB1").json()
+    assert pb["issued_quantity"] == 100 and pb["remaining_quantity"] == 900
+    # 核对包仍记录 stale 状态
+    pkg = client.get(f"/labels/{lid}/check-package").json()
+    assert pkg["label"]["stale"] is True
