@@ -45,6 +45,16 @@ def seed_base(client: TestClient) -> str:
     client.post("/lines", json={"id": "L1", "name": "1号产线",
                                 "allergens_handled": ["milk", "peanut"]})
     client.post("/products/COOKIE/lines/L1")
+    # 批次：含奶花生的 B01 在前，曲奇 B02 在后；无清洁记录 -> 两条路径均开放，
+    # 与旧静态推导（共线处理奶/花生）的保守结论一致
+    client.post("/batches", json={
+        "batch_id": "B01", "product_id": "COOKIE", "line_id": "L1", "sequence": 1,
+        "allergens": ["milk", "peanut"],
+        "equipment_segments": [{"segment_id": "MIX", "name": "搅拌段"}]})
+    client.post("/batches", json={
+        "batch_id": "B02", "product_id": "COOKIE", "line_id": "L1", "sequence": 2,
+        "allergens": [],
+        "equipment_segments": [{"segment_id": "MIX", "name": "搅拌段"}]})
     return "COOKIE"
 
 

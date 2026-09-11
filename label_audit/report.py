@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 
+from . import trace
 from .db import utcnow
 from .engine import analyze_label, expand_recipe
 
@@ -17,6 +18,8 @@ def build_check_package(store, label_id: str) -> dict:
     exp = expand_recipe(store, label["product_id"])
     findings = store.findings_for_label(label_id)
     approvals = store.approvals_for_label(label_id)
+    batch_id = store.get_label_batch(label_id)
+    batch_evidence = trace.batch_trace_evidence(store, batch_id) if batch_id else None
 
     spec_refs = sorted({e["source"] for b in (label["derived"] or {}).values()
                         for evs in b.values() for e in evs
@@ -35,6 +38,19 @@ def build_check_package(store, label_id: str) -> dict:
             "ref": f"line:{line['id']}", "line_id": line["id"],
             "name": line["name"], "allergens_handled": line["allergens_handled"],
         })
+    if batch_evidence:
+        evidence_index["batch_trace"] = {
+            "batch_id": batch_id,
+            "segments": batch_evidence["batch"]["segments"],
+            "cleaning_records": [
+                {"ref": f"cleaning:{r['record_id']}", **r}
+                for r in batch_evidence["cleaning_records"]],
+            "cleaning_programs": [
+                {"ref": f"program:{p['program_id']}@{p['version']}", **p}
+                for p in batch_evidence["cleaning_programs"]],
+            "swab_results": [
+                {"ref": f"swab:{s['swab_id']}", **s} for s in batch_evidence["swab_results"]],
+        }
     if recipe:
         evidence_index["recipes"].append({
             "ref": f"recipe:{recipe['product_id']}:{recipe['version']}",
@@ -52,6 +68,8 @@ def build_check_package(store, label_id: str) -> dict:
         "derived": label["derived"],
         "findings": findings,
         "approvals": approvals,
+        "batch_id": batch_id,
+        "batch_trace": batch_evidence["trace"] if batch_evidence else None,
         "evidence_index": evidence_index,
     }
 
@@ -79,6 +97,8 @@ def build_review_sheet(store, label_id: str) -> str:
     derived = analysis["derived"]
     findings = store.findings_for_label(label_id)
     approvals = store.approvals_for_label(label_id)
+    batch_id = analysis.get("batch_id")
+    batch_trace = analysis.get("batch_trace")
 
     required_rows = [
         (a, ev) for a, evs in derived["required"].items() for ev in evs
@@ -86,6 +106,31 @@ def build_review_sheet(store, label_id: str) -> str:
     may_rows = [
         (a, ev) for a, evs in derived["may_contain"].items() for ev in evs
     ]
+
+    def batch_section() -> str:
+        if not batch_trace:
+            return ("<h2>四、批次共线追溯</h2>"
+                    "<table><tr><td class='empty'>未绑定生产批次（按产线历史登记"
+                    "保守推导）</td></tr></table>")
+        rows = ""
+        for p in batch_trace["paths"]:
+            gaps = "；".join(
+                f"{g['code']}" + (f"（{g.get('segment_id') or g.get('point_id') or ''}）"
+                                  if g.get("segment_id") or g.get("point_id") else "")
+                for g in p["evidence_gaps"]) or "—"
+            rows += (f"<tr><td>{_esc(p['allergen'])}</td>"
+                     f"<td>{_esc(p['source_batch_id'] or '未知')}</td>"
+                     f"<td>{_esc(p['source_kind'])}</td>"
+                     f"<td><b>{_esc(p['status'])}</b></td>"
+                     f"<td>{_esc(gaps)}</td>"
+                     f"<td>{_esc(p['route'])}</td></tr>")
+        return ("<h2>四、批次共线追溯（前序含敏原批次 + 返工路径）</h2>"
+                f"<table><tr><th>过敏原</th><th>来源批次</th><th>来源类型</th>"
+                f"<th>路径状态</th><th>证据缺口</th><th>追溯链</th></tr>{rows}</table>"
+                f"<p>审核批次：{_esc(batch_id)}（产线 {_esc(batch_trace['line_id'])}，"
+                f"顺序号 {batch_trace['sequence']}）；开放："
+                f"{_esc(', '.join(batch_trace['open_allergens']) or '无')}；"
+                f"已关闭：{_esc(', '.join(batch_trace['closed_allergens']) or '无')}</p>")
 
     def finding_cells(f):
         ov = f.get("override")
@@ -136,17 +181,19 @@ def build_review_sheet(store, label_id: str) -> str:
 {_rows(may_rows, [lambda r: r[0], lambda r: r[1]['status'], lambda r: r[1]['path'], lambda r: r[1]['source']])}
 </table>
 
-<h2>四、发现项（含覆盖记录）</h2>
+{batch_section()}
+
+<h2>五、发现项（含覆盖记录）</h2>
 <table><tr><th>类型</th><th>级别</th><th>状态</th><th>说明</th><th>覆盖理由与证据</th></tr>
 {''.join('<tr class="' + _esc(f['severity']) + '">' + ''.join(f'<td>{_esc(c)}</td>' for c in finding_cells(f)) + '</tr>' for f in findings) or "<tr><td colspan='5' class='empty'>（无）</td></tr>"}
 </table>
 
-<h2>五、批准记录</h2>
+<h2>六、批准记录</h2>
 <table><tr><th>#</th><th>批准人</th><th>批准时间</th></tr>
 {_rows(approvals, [lambda a: a['id'], lambda a: a['approved_by'], lambda a: a['approved_at']])}
 </table>
 
-<h2>六、签字</h2>
+<h2>七、签字</h2>
 <table class="sign"><tr><th>环节</th><th>签字</th><th>日期</th><th>备注</th></tr>
 {''.join(f"<tr><td>{s}</td><td></td><td></td><td></td></tr>" for s in ('草拟', '复核', '批准', '撤回'))}
 </table>

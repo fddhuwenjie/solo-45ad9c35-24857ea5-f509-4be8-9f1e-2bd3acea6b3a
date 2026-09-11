@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS swab_results (
     record_id TEXT NOT NULL,
     point_id TEXT NOT NULL,
     allergen TEXT NOT NULL,
-    value_ppm REAL NOT NULL,
+    value_ppm REAL,
     sampled_at TEXT,
     FOREIGN KEY (record_id) REFERENCES cleaning_records(record_id)
 );
@@ -545,6 +545,11 @@ class Store:
             self._decode_batch(r)
             for r in self._q("SELECT * FROM batches WHERE line_id = ? ORDER BY sequence", (line_id,))
         ]
+
+    def batch_at_sequence(self, line_id: str, sequence: int) -> dict | None:
+        r = self._one(
+            "SELECT * FROM batches WHERE line_id = ? AND sequence = ?", (line_id, sequence))
+        return self._decode_batch(r) if r else None
 
     def previous_batches(self, batch: dict) -> list[dict]:
         """同一产线上序号严格更小的批次（按序号倒序），用于向前追溯含敏原批次。"""

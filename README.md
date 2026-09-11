@@ -1,12 +1,13 @@
 # 食品标签审核 API
 
-供应商更换后，复合原料的次级配料与交叉接触声明会变化，旧标签未必同步。本服务为标签审核提供：
+供应商更换后，复合原料的次级配料与交叉接触声明会变化，旧标签未必同步。同一条产线做过花生产品，后续批次也不必永久标注“可能含花生”；反过来，清洁记录残缺时，单凭一张阴性拭子单同样不足以消除风险。本服务为标签审核提供：
 
 - **来源图展开**：从配方出发递归展开复合原料，定位每种过敏原的来源路径；
-- **声明推导**：由供应商声明与产线共线情况推导应声明项与交叉接触提示；
+- **逐批次共线追溯**：登记生产顺序、设备段、清洁程序版本及有效期、程序覆盖的过敏原、必检采样点、拭子定量结果与返工料去向，从待审批次向前追溯最近含敏原批次与返工路径；
+- **声明推导**：由供应商声明与逐批次追溯结果推导应声明项与交叉接触提示；
 - **问题检测**：资料缺口、别名混用、循环引用、无法展开的复合原料、“无某过敏原”宣称与资料的矛盾；
 - **生命周期**：草拟 → 复核 → 批准 → 撤回，未决矛盾阻止批准；
-- **影响传播**：配方/规格更新沿依赖图标记受影响产品，批准记录只读并派生新修订；
+- **影响传播**：配方/规格更新沿依赖图标记受影响产品；拭子结果补录沿返工影响链标记批次标签；批准记录只读并派生新修订；
 - **审核覆盖**：审核人可覆盖自动结论，但必须填写理由并关联输入证据；
 - **报告**：两版声明比较（增删 + 波及范围）、JSON 核对包、可打印审查单、请求样例。
 
@@ -16,7 +17,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 15 个端到端测试
+python -m pytest tests/                        # 端到端测试（16 + 21 个批次追溯测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -26,23 +27,52 @@ python -m pytest tests/                        # 15 个端到端测试
 ```
 配方(版本) ──┐
 原料规格版本 ─┼─> 来源图展开 ─> 过敏原证据(带路径) ─> 推导应声明项 ─┐
-供应商声明 ──┘      │                                            ├─> 发现项
-产线共线 ──────────┴────────────────────────────────────────────┘
-                                        标签文案 ──> 比对 ──> 批准/阻断
+供应商声明 ──┘                                                 ├─> 发现项
+前序含敏原批次 ─┐                                            ┌─┘
+清洁程序(有效期/覆盖过敏原) ─┼─> 逐批次追溯 ─> 开放/关闭路径 ─┘
+清洁记录/拭子定量(必检点) ─┤            ↑ 返工料去向（可跨产品、可传递）
+标签文案 ───────────────────────────────> 比对 ──> 批准/阻断
 ```
+
+## 逐批次追溯
+
+一条（过敏原 → 来源批次 → 设备段/返工）路径只有在以下条件**全部**满足时才关闭：
+
+1. 批次生产顺序明确（同产线按 `sequence` 可定位最近含敏原批次）；
+2. 待审批次登记的每个相关设备段都有清洁执行记录，记录产线与批次产线一致；
+3. 清洁引用的程序版本存在、适用于该产线（`line_id` 为空表示通用；指定 L2 的程序不能关闭 L1 路径）、覆盖该过敏原，且清洁日期处于程序有效期内；
+4. 程序声明的每个必检采样点都按对应过敏原采样（漏采即开放）；
+5. 拭子定量结果已出具且不超过程序限值（等于限值合格；待出/超限均开放，超限为 blocker）。
+
+返工料另作区分：源批次**成品本身含**的过敏原属于组分携带（`component_carried_over`），目标批次设备清洁只处理残留、不能去除已混入的组分，路径恒开放；源批次自身未关闭的设备残留路径则沿返工链（可跨产品、可传递）传播。
+
+| evidence_gap 代码 | 含义 |
+|---|---|
+| `order_unknown` | 批次生产顺序不明，无法定位最近含敏原批次 |
+| `missing_cleaning` | 设备段无清洁记录 / 批次未登记设备段 |
+| `program_unknown` | 清洁记录引用的程序版本不存在 |
+| `program_wrong_line` | 程序或清洁记录属于其他产线 |
+| `program_not_covering` | 程序不覆盖该过敏原 |
+| `validation_expired` | 清洁时程序不在有效期 / 清洁日期缺失无法核对 |
+| `missing_swab` | 必检采样点漏采 |
+| `swab_pending` | 已采样但定量结果未出 |
+| `swab_exceeded` | 拭子定量结果超限（blocker） |
+| `component_carried_over` | 返工源批次成品含该过敏原，清洁无法去除组分 |
+
+未登记任何批次时，推导回退为旧的产线 `allergens_handled` 静态保守推导。
 
 ## 检测规则
 
 | kind | 级别 | 含义 |
 |---|---|---|
-| `data_gap` | blocker | 未知原料引用 / 缺规格版本 / 缺供应商声明 / 过敏原状态未知 |
+| `data_gap` | blocker | 未知原料引用 / 缺规格版本 / 缺供应商声明 / 过敏原状态未知 / 拭子阳性超限（`missing=cleaning_validation`） |
 | `alias_conflict` | blocker / warning | 引用命中多个原料（blocker）；同一名称或别名被多个原料使用（warning） |
 | `circular_reference` | blocker | 复合原料子成分沿路径回到祖先 |
 | `unexpandable_compound` | blocker | 标记为复合原料但无子成分拆分 |
 | `missing_declaration` | blocker | 推导应声明而标签未声明 |
-| `missing_cross_contact` | warning | 交叉接触风险未在标签提示 |
+| `missing_cross_contact` | warning | 开放交叉接触路径未在标签提示 |
 | `unnecessary_declaration` | warning | 标签声明了推导不出的过敏原 |
-| `claim_contradiction` | blocker | “无某过敏原”宣称与原料/共线资料矛盾 |
+| `claim_contradiction` | blocker | “无某过敏原”宣称与原料资料或开放共线/返工路径矛盾 |
 
 批准前自动重新分析；存在 `open` 状态的 blocker 即拒绝（409）。
 
@@ -55,6 +85,10 @@ spec:{ingredient_id}:{version}                 原料规格版本
 declaration:{ingredient_id}:{version}:{allergen}   某条供应商声明
 line:{line_id}                                 产线
 recipe:{product_id}:{version}                  配方版本
+batch:{batch_id}                               生产批次
+program:{program_id}@{version}                 清洁程序版本
+cleaning:{record_id}                           清洁执行记录
+swab:{swab_id}                                 拭子结果
 ```
 
 覆盖按发现项指纹（kind + 主体）保留，重新分析不会丢失；资料变化导致发现项消解时自动转为 `resolved`。
@@ -63,7 +97,8 @@ recipe:{product_id}:{version}                  配方版本
 
 - 新规格版本 / 新配方 / 共线变更 → 沿依赖图找出引用该产品或原料的所有标签；
 - 草稿、复核中的标签标记 `stale`；已批准标签标记 `stale` 并**派生新修订**（草稿、重新分析）；
-- `approvals` 表只插不改，批准快照（文案 + 推导 + 发现项）永久保留。
+- `PUT /swabs/{id}/result` 补录拭子定量结果时自动处理：草稿/复核中标签立即重新分析（阴性补录可消解“结果待出”的开放路径）；结果超限且采样点/过敏原属程序验证对象时，沿返工影响链传播，已批准标签标记 `stale` 并派生新修订，调用方无需手工触发；
+- `approvals` 表只插不改；批准快照永久保留文案、推导、发现项，以及**逐批次追溯采用的清洁程序版本、清洁记录与拭子结果**——后续补录不改写已冻结快照。
 
 ## 主要接口
 
@@ -72,15 +107,20 @@ recipe:{product_id}:{version}                  配方版本
 | POST | `/ingredients` · `/ingredients/{id}/versions` | 原料与规格版本（含子成分、供应商声明） |
 | POST | `/products` · `/products/{id}/recipes` | 产品与配方版本 |
 | POST | `/lines` · `/products/{id}/lines/{line_id}` | 产线与共线登记 |
-| GET | `/products/{id}/source-graph` | 来源图 + 推导 + 发现项 |
+| POST | `/batches` | 生产批次（产线、顺序号、设备段、本批次过敏原） |
+| GET | `/batches/{id}` · `/batches/{id}/trace` | 批次详情（含返工进出）/ 逐批追溯开闭路径 |
+| POST | `/cleaning-programs` | 清洁程序版本（覆盖过敏原、必检点、有效期、限值） |
+| POST | `/cleaning-records` | 清洁执行记录（批次、设备段、程序版本、清洁日期） |
+| POST | `/swabs` · PUT `/swabs/{id}/result` | 拭子登记（`value_ppm` 可空=待出）/ 定量结果补录（自动影响传播） |
+| POST | `/rework-paths` | 返工料去向（可跨产品，拒绝成环） |
+| GET | `/products/{id}/source-graph?batch_id=` | 来源图 + 批次追溯 + 推导 + 发现项 |
 | GET | `/products/{id}/impact` | 依赖视图与标签过期状态 |
 | GET | `/products/{id}/labels/compare?from_revision=&to_revision=` | 两版声明增删 + 波及范围 |
-| POST | `/labels` · `/labels/{id}/submit` · `/approve` · `/withdraw` | 生命周期 |
-| PUT | `/labels/{id}/copy` | 修改文案（草稿/复核中） |
-| GET | `/labels/{id}/analysis` · POST `/labels/{id}/reanalyze` | 分析 |
+| POST | `/labels`（可带 `batch_id`）· `/submit` · `/approve` · `/withdraw` | 生命周期（批次绑定持久化） |
+| PUT | `/labels/{id}/copy` · POST `/labels/{id}/reanalyze?batch_id=` | 修改文案 / 重新分析（可改绑批次） |
 | POST | `/labels/{id}/findings/{fid}/override` | 覆盖自动结论 |
-| GET | `/labels/{id}/check-package` | JSON 核对包 |
-| GET | `/labels/{id}/review-sheet` | 可打印审查单（HTML） |
+| GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引） |
+| GET | `/labels/{id}/review-sheet` | 可打印审查单（HTML，含追溯小节） |
 | GET | `/samples/compound-coline` | 复合原料 + 共线冲突请求样例 |
 | GET | `/events` | 审计事件日志 |
 
@@ -95,8 +135,10 @@ label_audit/
   main.py     FastAPI 路由与生命周期状态机
   models.py   Pydantic 请求校验
   engine.py   规则引擎：展开、推导、检测、影响、比较
+  trace.py    逐批次追溯：路径开闭、返工链、批准快照证据
   db.py       SQLite 持久层（approvals 只读）
   report.py   JSON 核对包 / 可打印审查单
 samples/compound_coline.json   请求样例
-tests/test_api.py              15 个端到端测试
+tests/test_api.py              16 个端到端测试
+tests/test_batch_trace.py      21 个逐批追溯/补录传播回归测试
 ```

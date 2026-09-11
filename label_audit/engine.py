@@ -300,7 +300,7 @@ def compare_with_copy(copy: dict, derived: dict) -> list[Finding]:
             {"allergen": a, "evidence": _evidence_summary(req[a])},
             subject=f"allergen:{a}",
         ))
-    for a in sorted(set(may) - labeled_may):
+    for a in sorted(set(may) - labeled_may - free):
         findings.append(Finding(
             "missing_cross_contact", WARNING,
             f"交叉接触风险 “{a}” 未在标签提示",
@@ -425,11 +425,12 @@ def impacted_batches_via_rework(store, batch_ids) -> set[str]:
     return hit
 
 
-def apply_batch_impact(store, batch_ids, reason: str) -> list[dict]:
-    """阳性补录后的沿链影响：
+def apply_batch_impact(store, batch_ids, reason: str, positive: bool = True) -> list[dict]:
+    """补录后的沿链影响：
 
-    - 草稿/复核中标签：重新分析（同一绑定批次），开放路径立即重开；
-    - 已批准标签：冻结的批准记录不动，标记 stale 并派生新修订（草稿、重新分析）；
+    - 草稿/复核中标签：重新分析（同一绑定批次），开放路径立即重开/消解；
+    - 已批准标签（仅阳性补录）：冻结的批准记录不动，标记 stale 并派生新修订
+      （草稿、重新分析）；阴性补录不影响已批准标签；
     - 已撤回标签：仅记录，不派生。
     """
     actions = []
@@ -444,7 +445,7 @@ def apply_batch_impact(store, batch_ids, reason: str) -> list[dict]:
                                 "product_id": label["product_id"],
                                 "revision": label["revision"],
                                 "action": "reanalyzed"})
-            elif label["status"] == "approved":
+            elif label["status"] == "approved" and positive:
                 store.set_stale(label_id, True)
                 new_label = store.create_label(label["product_id"], label["copy"],
                                                parent_id=label["id"])
@@ -457,7 +458,8 @@ def apply_batch_impact(store, batch_ids, reason: str) -> list[dict]:
                                 "product_id": label["product_id"],
                                 "revision": new_label["revision"],
                                 "action": "derived_new_revision"})
-    store.log_event("batch_impact_applied", {"reason": reason, "actions": actions})
+    store.log_event("batch_impact_applied", {"reason": reason, "positive": positive,
+                                             "actions": actions})
     return actions
 
 
@@ -562,4 +564,17 @@ def validate_evidence_ref(store, ref: str) -> bool:
         return store.get_line(parts[1]) is not None
     if len(parts) == 3 and parts[0] == "recipe":
         return store.get_recipe(parts[1], parts[2]) is not None
+    if len(parts) == 2 and parts[0] == "batch":
+        return store.get_batch(parts[1]) is not None
+    if len(parts) == 2 and parts[0] == "cleaning":
+        return store.get_cleaning_record(parts[1]) is not None
+    if len(parts) == 2 and parts[0] == "swab":
+        return store.get_swab(parts[1]) is not None
+    if len(parts) >= 3 and parts[0] == "program":
+        # program:{program_id}@{version}
+        body = ref[len("program:"):]
+        if "@" not in body:
+            return False
+        pid, ver = body.rsplit("@", 1)
+        return store.get_cleaning_program(pid, ver) is not None
     return False

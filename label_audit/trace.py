@@ -16,12 +16,14 @@
   missing_swab         必检采样点漏采
   swab_pending         已采样但定量结果未出
   swab_exceeded        拭子定量结果超限（blocker）
+  program_wrong_line   程序/清洁记录属于其他产线，不能用于本产线路径
+  component_carried_over 返工源批次成品本身含该过敏原，目标批次清洁不能去除组分
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .engine import BLOCKER, WARNING, Finding, norm
+from .engine import BLOCKER, Finding, norm
 
 # 阻断批准的证据缺口：仅凭残缺记录不能放行
 BLOCKER_GAPS = {"swab_exceeded"}
@@ -56,11 +58,11 @@ def _date(s: str | None) -> str | None:
     return s[:10]
 
 
-def evaluate_segment(store, target_batch: dict, segment_id: str, allergen: str,
-                     source_batch_id: str) -> tuple[str, list[dict], list[dict]]:
+def evaluate_segment(store, target_batch: dict, segment_id: str,
+                     allergen: str) -> tuple[list[dict], list[dict]]:
     """评估单条设备段上的清洁/验证证据。
 
-    返回 (status, gaps, evidence)。status ∈ closed/open。
+    返回 (gaps, evidence)；gaps 为空即该设备段对该过敏原验证通过。
     """
     gaps: list[dict] = []
     evidence: list[dict] = []
@@ -68,9 +70,17 @@ def evaluate_segment(store, target_batch: dict, segment_id: str, allergen: str,
     if not records:
         gaps.append({"code": "missing_cleaning", "segment_id": segment_id,
                      "detail": "该设备段在本批次投产前无清洁记录"})
-        return "open", gaps, evidence
+        return gaps, evidence
     # 可能登记了多段清洁，取最近一条（同批次同设备段按插入顺序最后一条）
     rec = records[-1]
+    if rec["line_id"] != target_batch["line_id"]:
+        gaps.append({"code": "program_wrong_line", "segment_id": segment_id,
+                     "record_id": rec["record_id"],
+                     "record_line_id": rec["line_id"],
+                     "batch_line_id": target_batch["line_id"],
+                     "detail": f"清洁记录 {rec['record_id']} 属于产线 {rec['line_id']}，"
+                               f"不能用于产线 {target_batch['line_id']} 的批次"})
+        return gaps, evidence
     evidence.append({"type": "cleaning_record", "ref": f"cleaning:{rec['record_id']}",
                      "record_id": rec["record_id"], "segment_id": segment_id,
                      "program": f"{rec['program_id']}@{rec['program_version']}"})
@@ -79,12 +89,21 @@ def evaluate_segment(store, target_batch: dict, segment_id: str, allergen: str,
         gaps.append({"code": "program_unknown", "segment_id": segment_id,
                      "program": f"{rec['program_id']}@{rec['program_version']}",
                      "detail": "清洁记录引用的程序版本不存在"})
-        return "open", gaps, evidence
+        return gaps, evidence
+    # 程序必须适用于本产线：line_id 为空表示全产线通用；指定产线的程序不能跨线使用
+    if program["line_id"] is not None and program["line_id"] != target_batch["line_id"]:
+        gaps.append({"code": "program_wrong_line", "segment_id": segment_id,
+                     "program": f"{program['program_id']}@{program['version']}",
+                     "program_line_id": program["line_id"],
+                     "batch_line_id": target_batch["line_id"],
+                     "detail": f"程序属于产线 {program['line_id']}，"
+                               f"不能用于产线 {target_batch['line_id']} 的批次"})
+        return gaps, evidence
     if norm(allergen) not in {norm(a) for a in program["allergens"]}:
         gaps.append({"code": "program_not_covering", "segment_id": segment_id,
                      "program": f"{program['program_id']}@{program['version']}",
                      "detail": f"程序不覆盖过敏原 {allergen}"})
-        return "open", gaps, evidence
+        return gaps, evidence
     cleaned = _date(rec.get("cleaned_at")) or _date(target_batch.get("started_at"))
     vf, vu = _date(program.get("valid_from")), _date(program.get("valid_until"))
     if (vf and cleaned and cleaned < vf) or (vu and cleaned and cleaned > vu):
@@ -93,13 +112,13 @@ def evaluate_segment(store, target_batch: dict, segment_id: str, allergen: str,
                      "cleaned_at": cleaned, "valid_from": vf, "valid_until": vu,
                      "detail": "清洁时程序不在有效期内"})
         # 过期程序的拭子结果同样不能采信，直接判开放
-        return "open", gaps, evidence
+        return gaps, evidence
     if (vf or vu) and not cleaned:
         gaps.append({"code": "validation_expired", "segment_id": segment_id,
                      "program": f"{program['program_id']}@{program['version']}",
                      "cleaned_at": None, "valid_from": vf, "valid_until": vu,
                      "detail": "清洁日期缺失，无法确认程序在有效期内"})
-        return "open", gaps, evidence
+        return gaps, evidence
     swabs = store.swabs_for_record(rec["record_id"])
     # 同一采样点可能检测多种过敏原；关闭某过敏原路径时只采信对应过敏原的拭子
     by_point: dict[str, dict] = {}
@@ -127,7 +146,7 @@ def evaluate_segment(store, target_batch: dict, segment_id: str, allergen: str,
                          "value_ppm": swab["value_ppm"], "limit_ppm": program["limit_ppm"],
                          "detail": f"拭子结果 {swab['value_ppm']} ppm 超过限值 "
                                    f"{program['limit_ppm']} ppm"})
-    return ("closed" if not gaps else "open"), gaps, evidence
+    return gaps, evidence
 
 
 def _build_path(store, target_batch: dict, allergen: str, source_batch_id: str | None,
@@ -140,8 +159,8 @@ def _build_path(store, target_batch: dict, allergen: str, source_batch_id: str |
         path.evidence_gaps.append(order_gap)
     else:
         for seg in target_batch["segments"]:
-            status, gaps, ev = evaluate_segment(
-                store, target_batch, seg["segment_id"], allergen, source_batch_id or "")
+            gaps, ev = evaluate_segment(
+                store, target_batch, seg["segment_id"], allergen)
             path.evidence_gaps.extend(gaps)
             path.evidence.extend(ev)
         if not target_batch["segments"]:
@@ -152,70 +171,87 @@ def _build_path(store, target_batch: dict, allergen: str, source_batch_id: str |
     return path
 
 
-def _collect_paths(store, batch_id: str, _seen: set | None = None) -> list[TracePath]:
-    """递归收集待追溯路径：同产线前序最近含敏原批次 + 返工路径（可跨产品、可传递）。"""
-    if _seen is None:
-        _seen = set()
-    if batch_id in _seen:
-        return []
-    _seen.add(batch_id)
-    batch = store.get_batch(batch_id)
-    if batch is None:
-        return []
+def _line_paths(store, batch: dict) -> list[TracePath]:
+    """批次自身在同产线上的前序残留路径（在本批次设备段上验证清洁）。"""
     paths: list[TracePath] = []
-
-    # 1) 同产线前序：按生产顺序为每个过敏原找最近的含敏原批次
     previous = store.previous_batches(batch)
     if previous:
-        prev = previous[0]  # 序号最近的前序批次
-        # 序号连续仅用于提示；真正按过敏原分别定位最近批次
         found: dict[str, str] = {}
-        for cand in previous:
+        for cand in previous:  # previous 已按序号倒序，setdefault 保留最近批次
             for a in cand["allergens"]:
                 found.setdefault(norm(a), cand["batch_id"])
         for allergen, src in sorted(found.items()):
             paths.append(_build_path(
                 store, batch, allergen, src, "previous_batch",
-                f"批次 {batch_id} <产线 {batch['line_id']}> 前序批次 {src} 含 {allergen}"))
+                f"批次 {batch['batch_id']} <产线 {batch['line_id']}> 前序批次 {src} 含 {allergen}"))
     else:
         # 无任何前序批次：无法确认顺序/历史，保守标记顺序缺口（不凭空引入过敏原）
         line = store.get_line(batch["line_id"])
         for a in (line["allergens_handled"] if line else []):
             paths.append(_build_path(
                 store, batch, a, None, "unknown",
-                f"批次 {batch_id} 在产线 {batch['line_id']} 上无可排序的前序批次记录",
+                f"批次 {batch['batch_id']} 在产线 {batch['line_id']} 上无可排序的前序批次记录",
                 order_gap={"code": "order_unknown",
                            "detail": "批次生产顺序不明，无法定位最近含敏原批次；"
                                      "产线历史登记过敏原需保守保留"}))
+    return paths
 
-    # 2) 返工路径：余料来源批次（可跨产品）。源批次自身的开放路径同样可传递
-    for rw in store.rework_into(batch_id):
+
+def _rework_paths(store, batch: dict, chain_seen: frozenset) -> list[TracePath]:
+    """返工路径：
+
+    a) 源批次成品含有的过敏原 -> 组分携带，目标批次设备清洁无法去除（恒开放）；
+    b) 源批次自身未关闭的同线/返工残留路径 -> 随返工料传递（带缺口直接传递，
+       不再用目标批次设备段重新验证，避免“目标清洁良好”掩盖上游污染）。
+    """
+    paths: list[TracePath] = []
+    for rw in store.rework_into(batch["batch_id"]):
         src = store.get_batch(rw["source_batch_id"])
-        if src is None:
+        if src is None or rw["source_batch_id"] in chain_seen:
             continue
-        for a in src["allergens"]:
-            a = norm(a)
-            if any(p.allergen == a and p.source_kind == "rework"
-                   and p.source_batch_id == src["batch_id"] for p in paths):
-                continue
-            pct = f"（返工比例 {rw['percentage']}%）" if rw.get("percentage") is not None else ""
-            paths.append(_build_path(
-                store, batch, a, src["batch_id"], "rework",
-                f"返工料自批次 {src['batch_id']}（产品 {src['product_id']}）"
-                f"投入 {batch_id}{pct}，源批次含 {a}"))
-        # 源批次未关闭的共线路径随返工料传递
-        for sub in _collect_paths(store, src["batch_id"], _seen | set()):
+        pct = f"（返工比例 {rw['percentage']}%）" if rw.get("percentage") is not None else ""
+        component = {norm(a) for a in src["allergens"]}
+        # a) 组分携带
+        for a in sorted(component):
+            paths.append(TracePath(
+                allergen=a, source_batch_id=src["batch_id"], source_kind="rework",
+                route=f"返工料自批次 {src['batch_id']}（产品 {src['product_id']}）"
+                      f"投入 {batch['batch_id']}{pct}：源批次成品本身含 {a}，"
+                      f"设备清洁不能去除已混入组分",
+                status="open",
+                evidence_gaps=[{"code": "component_carried_over",
+                                "detail": "返工源批次成品含有该过敏原，目标批次设备清洁"
+                                          "只处理残留、不能去除已混入的组分"}],
+            ))
+        # b) 源批次自身未关闭的残留路径（同线 + 源批次的返工链）随返工料传递
+        upstream = _line_paths(store, src)
+        upstream += _rework_paths(store, src, chain_seen | {src["batch_id"]})
+        for sub in upstream:
             if sub.status == "closed":
                 continue
+            if sub.allergen in component:
+                continue  # 组分路径已以 component_carried_over 表达
             if any(p.allergen == sub.allergen and p.source_batch_id == sub.source_batch_id
-                   and p.source_kind == "rework" for p in paths):
+                   for p in paths):
                 continue
-            paths.append(_build_path(
-                store, batch, sub.allergen, sub.source_batch_id, "rework",
-                f"返工链 {sub.source_batch_id} -> {src['batch_id']} -> {batch_id}："
-                f"{sub.allergen} 交叉接触路径未关闭",
-                order_gap=sub.evidence_gaps[0] if sub.evidence_gaps else None))
+            paths.append(TracePath(
+                allergen=sub.allergen, source_batch_id=sub.source_batch_id,
+                source_kind="rework",
+                route=f"返工链 {sub.source_batch_id} -> {src['batch_id']} -> "
+                      f"{batch['batch_id']}：{sub.allergen} 残留路径未关闭（{sub.route}）",
+                status="open",
+                evidence_gaps=list(sub.evidence_gaps),
+                evidence=list(sub.evidence),
+            ))
     return paths
+
+
+def _collect_paths(store, batch_id: str) -> list[TracePath]:
+    """收集待追溯路径：同产线前序残留 + 返工组分/返工链传递（可跨产品、可传递）。"""
+    batch = store.get_batch(batch_id)
+    if batch is None:
+        return []
+    return _line_paths(store, batch) + _rework_paths(store, batch, frozenset({batch_id}))
 
 
 def trace_batch(store, batch_id: str) -> dict:
@@ -267,6 +303,36 @@ def open_cross_contact(store, batch_id: str) -> dict:
             "evidence_gaps": p["evidence_gaps"],
         })
     return may
+
+
+def batch_trace_evidence(store, batch_id: str) -> dict:
+    """收集批次追溯实际采用的清洁程序与检测记录，供批准快照冻结。
+
+    冻结对象：批次登记的每个设备段上、批次投产前的清洁记录（最新一条）、
+    其引用的程序版本（按 program_id@version 去重）及该记录下的全部拭子结果。
+    批准后这些值随 approvals 快照永久保留，不受后续补录影响。
+    """
+    batch = store.get_batch(batch_id)
+    if batch is None:
+        raise KeyError(f"batch {batch_id} not found")
+    records, programs, swabs = [], {}, []
+    for seg in batch["segments"]:
+        recs = store.cleaning_records_for_batch(batch_id, seg["segment_id"])
+        if not recs:
+            continue
+        rec = recs[-1]
+        records.append(rec)
+        prog = store.get_cleaning_program(rec["program_id"], rec["program_version"])
+        if prog is not None:
+            programs[f"{prog['program_id']}@{prog['version']}"] = prog
+        swabs.extend(store.swabs_for_record(rec["record_id"]))
+    return {
+        "batch": batch,
+        "cleaning_records": records,
+        "cleaning_programs": sorted(programs.values(), key=lambda p: (p["program_id"], p["version"])),
+        "swab_results": swabs,
+        "trace": trace_batch(store, batch_id),
+    }
 
 
 def trace_findings(store, batch_id: str, copy: dict) -> list[Finding]:
