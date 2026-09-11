@@ -35,6 +35,10 @@ class IngredientVersionCreate(BaseModel):
     version: str = Field(min_length=1)
     sub_components: list[SubComponent] = []
     supplier_declarations: list[SupplierDeclaration] = []
+    corrects_version: Optional[str] = Field(
+        default=None,
+        description="本次更正针对的旧规格版本；缺省取登记前最新版本。"
+                    "影响传播只沿被更正规格对应批号的扣料关系展开")
 
 
 class ProductCreate(BaseModel):

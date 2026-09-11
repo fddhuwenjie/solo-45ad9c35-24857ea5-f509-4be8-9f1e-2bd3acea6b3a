@@ -259,13 +259,17 @@ def test_source_graph_expands_from_locked_allocation_spec(client):
     assert flour["version"] == "v1" and "LOT-F1" in flour["note"]
     ev = graph["derived"]["required"]["wheat"][0]
     assert ev["lot_ids"] == ["LOT-F1"]
-    # 无投料记录的批次回退旧语义：配方锁定版本仍按锁定展开（v1，无 milk）
+    # 无投料记录的批次（原料已启用批号管理）：不得回退配方锁定/当前/最新
+    # 规格，逐项记 material_allocation 证据空白，推导为空
     client.post("/batches", json={
         "batch_id": "B3", "product_id": "P", "line_id": "L1", "sequence": 2,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
     graph3 = client.get("/products/P/source-graph", params={"batch_id": "B3"}).json()
-    assert "milk" not in graph3["derived"]["required"]
-    # 配方未锁定版本且无投料记录时，回退现行规格（v2 -> 含 milk）
+    assert graph3["derived"]["required"] == {}
+    gaps3 = [f for f in graph3["findings"]
+             if f["detail"].get("missing") == "material_allocation"]
+    assert {f["detail"]["ingredient_id"] for f in gaps3} == {"FLOUR", "SUGAR"}
+    # 配方未锁定版本同样不得回退最新规格（v2 的 milk 不出现）
     client.post("/products", json={"id": "P3", "name": "威化"})
     client.post("/products/P3/recipes", json={
         "version": "v1",
@@ -274,7 +278,9 @@ def test_source_graph_expands_from_locked_allocation_spec(client):
         "batch_id": "B5", "product_id": "P3", "line_id": "L1", "sequence": 5,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
     graph5 = client.get("/products/P3/source-graph", params={"batch_id": "B5"}).json()
-    assert "milk" in graph5["derived"]["required"]
+    assert "milk" not in graph5["derived"]["required"]
+    assert [f for f in graph5["findings"]
+            if f["detail"].get("missing") == "material_allocation"]
 
 
 def test_missing_usage_record_flags_evidence_gap(client):
@@ -319,7 +325,7 @@ def test_supplier_correction_follows_consumption_chain(client):
     client.post("/batches", json={
         "batch_id": "BX", "product_id": "P2", "line_id": "L2", "sequence": 1,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
-    # P 标签批准并发放卷标到 B2；P2 标签批准
+    # P 标签批准并发放卷标到 B2；P2 批次无投料记录 -> 证据空白阻止批准
     label = make_label(client)
     client.post(f"/labels/{label['id']}/submit")
     assert client.post(f"/labels/{label['id']}/approve",
@@ -332,9 +338,12 @@ def test_supplier_correction_follows_consumption_chain(client):
     label2 = client.post("/labels", json={
         "product_id": "P2", "batch_id": "BX",
         "copy": {"declared_allergens": ["wheat"]}}).json()
+    gaps2 = [f for f in label2["open_blockers"]
+             if f["detail"].get("missing") == "material_allocation"]
+    assert [f["detail"]["ingredient_id"] for f in gaps2] == ["FLOUR"]
     client.post(f"/labels/{label2['id']}/submit")
     assert client.post(f"/labels/{label2['id']}/approve",
-                       json={"approved_by": "qa"}).status_code == 200
+                       json={"approved_by": "qa"}).status_code == 409
 
     # 供应商更正：FLOUR 实际含奶（v1 声明 milk absent -> v2 声明 milk present）
     res = client.post("/ingredients/FLOUR/versions", json={
@@ -358,10 +367,18 @@ def test_supplier_correction_follows_consumption_chain(client):
          "old_status": "absent", "new_status": "present"}]
     assert corr["affected_batches"] == ["B2"]
     assert corr["affected_products"] == ["P"]
-    # 其他成品保持原状态
-    assert corr["unaffected_products"] == ["P2"]
+    assert corr["corrected_versions"] == ["v1"]
+    # 批次无投料记录的产品不得判为未受影响：列入 consumption_unknown 证据空白
+    assert corr["unaffected_products"] == []
+    assert corr["consumption_unknown"] == [{
+        "product_id": "P2",
+        "unrecorded_batches": ["BX"],
+        "evidence_gap": "material_allocation",
+        "detail": "批次无该原料的有效投料记录，无法证明未消耗被更正规格，"
+                  "不得判为未受影响"}]
+    # 但未证明受影响的产品不强行传播：P2 标签保持原状态（复核中、未 stale）
     view2 = client.get(f"/labels/{label2['id']}").json()
-    assert view2["status"] == "approved" and view2["stale"] is False
+    assert view2["status"] == "in_review" and view2["stale"] is False
     # 处置边界：P 标签 stale + 派生新修订；已发放卷标冻结并列出处置批次
     boundary = corr["disposition_boundary"]
     assert {l["action"] for l in boundary["labels"]} == \
@@ -432,10 +449,13 @@ def test_reverse_allocation_writes_reverse_ledger_and_restores_quantity(client):
     assert [(e["kind"], e["quantity"]) for e in view["lot_ledger"]] == \
         [("allocate", 40), ("reverse", 40)]
     assert view["allocations"][0]["status"] == "reversed"
-    # 全部撤销后来源图回退现行规格展开，不再报用料缺项
+    # 全部撤销后批次回到“无有效投料记录”：原料已启用批号管理，来源图
+    # 不得回退现行规格，逐项记 material_allocation 证据空白
     graph = client.get("/products/P/source-graph", params={"batch_id": "B9"}).json()
-    assert not [f for f in graph["findings"]
-                if f["detail"].get("missing") == "material_allocation"]
+    gaps = [f for f in graph["findings"]
+            if f["detail"].get("missing") == "material_allocation"]
+    assert {f["detail"]["ingredient_id"] for f in gaps} == {"FLOUR", "SUGAR"}
+    assert graph["derived"]["required"] == {}
     # 重复撤销 409；不存在 404；缺理由 422
     assert client.post(f"/allocations/{alloc_id}/reverse",
                        json={"reason": "again"}).status_code == 409
@@ -459,6 +479,129 @@ def test_reverse_rejected_after_batch_started(client):
     assert r.status_code == 409
     assert "已开工" in r.json()["detail"]["error"]
     assert client.get("/lots/LOT-F1").json()["remaining_quantity"] == 90
+
+
+# -------------------------------------------------------------- 原子事务与并发
+
+def test_concurrent_same_key_allocations_deduct_once(client):
+    """并发同键请求：只扣量一次、只留一组分配与流水。"""
+    setup_world(client)
+    make_lot(client, "LOT-F1")
+    import concurrent.futures
+
+    def post(_):
+        return client.post("/batches/B2/allocations", json={
+            "idempotency_key": "race", "items": [{"lot_id": "LOT-F1", "quantity": 10}]})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(post, range(8)))
+    statuses = sorted(r.status_code for r in results)
+    assert statuses.count(201) == 1            # 恰好一个请求真正扣量
+    assert statuses.count(200) == 7            # 其余复用原结果
+    created = next(r for r in results if r.status_code == 201).json()
+    for r in results:
+        assert [a["allocation_id"] for a in r.json()["allocations"]] == \
+            [a["allocation_id"] for a in created["allocations"]]
+    lot = client.get("/lots/LOT-F1").json()
+    assert lot["allocated_quantity"] == 10 and lot["remaining_quantity"] == 90
+    view = client.get("/batches/B2").json()
+    assert len(view["allocations"]) == 1
+    assert [e["kind"] for e in view["lot_ledger"]] == ["allocate"]
+    # 事件日志同样只有一组扣量记录
+    assert len([e for e in client.get("/events").json()
+                if e["kind"] == "lots_allocated"]) == 1
+
+
+def test_conflict_and_gate_failure_leave_no_side_effects(client):
+    """冲突/门禁失败路径不残留副作用：无分配、无流水、余量不变。"""
+    setup_world(client)
+    make_lot(client, "LOT-F1")
+    allocate_ok(client, "B2", "k1", [{"lot_id": "LOT-F1", "quantity": 40}])
+    before = client.get("/lots/LOT-F1").json()
+    # 同键冲突
+    assert allocate(client, "B2", "k1",
+                    [{"lot_id": "LOT-F1", "quantity": 41}]).status_code == 409
+    # 门禁失败（超量）
+    assert allocate(client, "B2", "k2",
+                    [{"lot_id": "LOT-F1", "quantity": 999}]).status_code == 409
+    after = client.get("/lots/LOT-F1").json()
+    assert (after["allocated_quantity"], after["remaining_quantity"]) == \
+        (before["allocated_quantity"], before["remaining_quantity"])
+    view = client.get("/batches/B2").json()
+    assert len(view["allocations"]) == 1
+    assert [e["kind"] for e in view["lot_ledger"]] == ["allocate"]
+
+
+# -------------------------------------------------------------- 更正范围隔离（v1/v2 -> v3）
+
+def test_correction_scope_isolated_to_corrected_version(client):
+    """v1、v2 批号同时在库，v3 更正 v2：只波及 v2 批号的扣料关系。"""
+    client.post("/ingredients", json={"id": "FLOUR", "name": "小麦粉"})
+    for ver, decls in (("v1", [{"allergen": "wheat", "status": "present"}]),
+                       ("v2", [{"allergen": "wheat", "status": "present"},
+                               {"allergen": "sesame", "status": "may_contain"}])):
+        client.post("/ingredients/FLOUR/versions", json={
+            "version": ver, "supplier_declarations": decls})
+    client.post("/lines", json={"id": "L1", "name": "1号线", "allergens_handled": []})
+    # 两个产品配方分别锁定 v1 / v2，各自批次消耗对应批号
+    for pid, ver, lot, batch, seq in (("P1", "v1", "LOT-V1", "B1", 1),
+                                      ("P2", "v2", "LOT-V2", "B2", 2)):
+        client.post("/products", json={"id": pid, "name": pid})
+        client.post(f"/products/{pid}/recipes", json={
+            "version": "r1",
+            "items": [{"ingredient_ref": "FLOUR", "version": ver, "percentage": 100}]})
+        client.post("/batches", json={
+            "batch_id": batch, "product_id": pid, "line_id": "L1", "sequence": seq,
+            "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+        make_lot(client, lot, spec=ver)
+        allocate_ok(client, batch, f"a-{batch}", [{"lot_id": lot, "quantity": 30}])
+    # 两个产品的标签（声明 wheat + sesame 提示）均批准
+    labels = {}
+    for pid, batch in (("P1", "B1"), ("P2", "B2")):
+        label = client.post("/labels", json={
+            "product_id": pid, "batch_id": batch,
+            "copy": {"declared_allergens": ["wheat"], "may_contain": ["sesame"]}}).json()
+        client.post(f"/labels/{label['id']}/submit")
+        assert client.post(f"/labels/{label['id']}/approve",
+                           json={"approved_by": "qa"}).status_code == 200
+        labels[pid] = label["id"]
+    # v3 更正 v2（sesame 实为 present）：只波及 LOT-V2 -> B2 -> P2
+    res = client.post("/ingredients/FLOUR/versions", json={
+        "version": "v3", "corrects_version": "v2",
+        "supplier_declarations": [{"allergen": "wheat", "status": "present"},
+                                  {"allergen": "sesame", "status": "present"}]})
+    assert res.status_code == 201, res.text
+    corr = res.json()["correction"]
+    assert corr["corrected_versions"] == ["v2"]
+    # v1 批号不得纳入 affected_lots
+    assert [l["lot_id"] for l in corr["affected_lots"]] == ["LOT-V2"]
+    assert corr["affected_lots"][0]["allocated_quantity"] == 30
+    assert corr["affected_batches"] == ["B2"]
+    assert corr["affected_products"] == ["P2"]
+    assert corr["declaration_changes"] == [
+        {"spec_version": "v2", "allergen": "sesame",
+         "old_status": "may_contain", "new_status": "present"}]
+    # P1 的投料记录证明其消耗的是 v1（非被更正规格）-> 未受影响且保持原状态
+    assert corr["unaffected_products"] == ["P1"]
+    assert corr["consumption_unknown"] == []
+    assert client.get(f"/labels/{labels['P1']}").json()["stale"] is False
+    assert client.get(f"/labels/{labels['P2']}").json()["stale"] is True
+    # 缺省 corrects_version 时取登记前最新版本（v3）：v1/v2 批号均不波及
+    res = client.post("/ingredients/FLOUR/versions", json={
+        "version": "v4",
+        "supplier_declarations": [{"allergen": "wheat", "status": "present"},
+                                  {"allergen": "sesame", "status": "present"}]})
+    corr = res.json()["correction"]
+    assert corr["corrected_versions"] == ["v3"]
+    assert corr["affected_lots"] == [] and corr["affected_products"] == []
+    assert sorted(corr["unaffected_products"]) == ["P1", "P2"]
+    # corrects_version 校验：不存在 / 与新版本相同 -> 422
+    assert client.post("/ingredients/FLOUR/versions", json={
+        "version": "v5", "corrects_version": "v9",
+        "supplier_declarations": []}).status_code == 422
+    assert client.post("/ingredients/FLOUR/versions", json={
+        "version": "v5", "corrects_version": "v5",
+        "supplier_declarations": []}).status_code == 422
 
 
 # -------------------------------------------------------------- 审查材料还原

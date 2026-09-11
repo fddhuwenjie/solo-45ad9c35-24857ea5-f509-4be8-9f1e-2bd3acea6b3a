@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 SCHEMA = """
@@ -253,6 +255,10 @@ class Store:
     """对 SQLite 的薄封装；所有方法返回已解码 JSON 字段的普通 dict。"""
 
     def __init__(self, path: str = ":memory:"):
+        # 单连接 + RLock：写操作串行化；transaction() 期间其他线程的写被阻塞，
+        # 保证“幂等检查 -> 门禁 -> 扣量 -> 登记”这类复合写不会被并发交错。
+        self._lock = threading.RLock()
+        self._txn_depth = 0
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -267,9 +273,36 @@ class Store:
         return rows[0] if rows else None
 
     def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        cur = self.conn.execute(sql, params)
-        self.conn.commit()
-        return cur
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            if self._txn_depth == 0:
+                self.conn.commit()
+            return cur
+
+    @contextmanager
+    def transaction(self):
+        """串行化写事务：块内所有 _exec 不逐条提交，随块结束原子 COMMIT，
+        异常时整体 ROLLBACK（冲突/失败路径不残留副作用）。可嵌套（仅最外层
+        真正开启事务）；持锁期间其他线程的写操作被阻塞。"""
+        with self._lock:
+            if self._txn_depth > 0:
+                self._txn_depth += 1
+                try:
+                    yield self
+                finally:
+                    self._txn_depth -= 1
+                return
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._txn_depth = 1
+            try:
+                yield self
+            except Exception:
+                self._txn_depth = 0
+                self.conn.rollback()
+                raise
+            else:
+                self._txn_depth = 0
+                self.conn.commit()
 
     def log_event(self, kind: str, payload: dict) -> None:
         self._exec(

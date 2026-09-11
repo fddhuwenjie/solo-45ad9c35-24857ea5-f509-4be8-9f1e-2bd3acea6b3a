@@ -19,7 +19,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（59 + 11 个投料谱系测试）
+python -m pytest tests/                        # 端到端测试（59 + 14 个投料谱系测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -114,10 +114,10 @@ swab:{swab_id}                                 拭子结果
    - 余量充足（同一请求内相同批号用量合并核对，`insufficient_quantity`）；
    - 规格符合配方：原料须在当前配方中（`ingredient_not_in_recipe`），配方项锁定版本时批号规格须一致（`spec_mismatch`）。
 
-   任一不符整体拒绝（409 + `failures`），不部分扣量。幂等键唯一：同键同内容重放复用原结果（不重复扣量），同键内容冲突 409——已扣量只增不减，没有倒扣入口。
-3. **锁定规格展开**：批次一旦存在有效投料记录，来源图（`/source-graph`、标签分析、放行门禁、核对包）按开工时锁定的投料规格展开，证据带 `lot_ids`；配方项缺用料记录时记 `data_gap`（`missing=material_allocation`，blocker）证据空白，**不回退最新规格**。批次无投料记录时保持旧的现行规格展开（兼容未启用批号管理的资料）。
-4. **供应商更正波及链**：登记新规格版本时，若该原料已有到货批号，则沿扣料关系定位消耗过旧规格批号的批次——受影响标签按批次影响链处理（草稿/复核中重新分析，已批准标 stale 并派生新修订），该修订下仍有余量的印刷批次冻结；响应 `correction` 列明涉事批号与用量（`affected_lots.consumed_by`）、声明差异（`declaration_changes`）与处置边界（`disposition_boundary`：受影响标签、冻结卷标、已发放到包装现场的生产批次），`unaffected_products` 中的其他成品保持原状态。原料尚无到货批号时回退旧的依赖图影响传播。
-5. `POST /allocations/{id}/reverse` 开工前撤销分配：记一笔 `reverse` 反向流水恢复批号余量；批次已开工（`started_at` 不晚于当前日期）后不可撤销。全部撤销后来源图回退现行规格展开。
+   任一不符整体拒绝（409 + `failures`），不部分扣量。幂等键唯一：同一幂等键的**幂等检查、门禁评估（含余量读取）、请求登记、分配与库存流水在同一个串行化事务内原子提交**——并发同键请求只扣量一次、只留一组分配与流水；同键同内容重放复用原结果（不重复扣量），同键内容冲突 409——已扣量只增不减，没有倒扣入口；冲突与门禁失败路径不残留任何副作用。
+3. **锁定规格展开**：批次一旦存在有效投料记录，来源图（`/source-graph`、标签分析、放行门禁、核对包）按开工时锁定的投料规格展开，证据带 `lot_ids`；配方项缺用料记录时记 `data_gap`（`missing=material_allocation`，blocker）证据空白，**不回退最新规格**。批次完全没有有效投料记录时，只要配方中任一原料已启用批号管理（存在到货批号），同样逐项记 `material_allocation` 证据空白、推导为空，**不得回退当前或最新规格**；仅当配方原料均未启用批号管理时才保持旧的现行规格展开（兼容旧资料）。
+4. **供应商更正波及链**：登记新规格版本时可用 `corrects_version` 显式指定本次被更正的旧规格（缺省取登记前最新版本）；若该原料已有到货批号，则**只沿被更正规格对应批号的实际扣料关系**定位批次——其他规格批号不纳入 `affected_lots`。受影响标签按批次影响链处理（草稿/复核中重新分析，已批准标 stale 并派生新修订），该修订下仍有余量的印刷批次冻结；响应 `correction` 列明被更正规格（`corrected_versions`）、涉事批号与用量（`affected_lots.consumed_by`）、声明差异（`declaration_changes`）与处置边界（`disposition_boundary`：受影响标签、冻结卷标、已发放到包装现场的生产批次）。引用该原料但批次无有效投料记录的产品无法证明未消耗，列入 `consumption_unknown`（`material_allocation` 证据空白），**不得判为未受影响**；只有每个批次都能以投料记录证明未消耗被更正规格的产品才进入 `unaffected_products` 保持原状态。原料尚无到货批号时回退旧的依赖图影响传播。
+5. `POST /allocations/{id}/reverse` 开工前撤销分配：记一笔 `reverse` 反向流水恢复批号余量；批次已开工（`started_at` 不晚于当前日期）后不可撤销。全部撤销后批次回到“无有效投料记录”，来源图按上条规则记证据空白。
 6. 审计还原：批次查询（`GET /batches/{id}`）带 `allocations` 与 `lot_ledger`；批准快照冻结当时的投料批号/规格/用量（`material_allocations`）；核对包 `material_genealogy` 汇总分配、批号、扣量流水与波及该批次的更正事件；审查单含投料谱系小节；事件日志记录 `lot_registered / lot_status_changed / lots_allocated / allocation_reversed / supplier_correction`。
 
 ## 印刷标签批次领用放行
@@ -186,5 +186,5 @@ samples/compound_coline.json   请求样例
 tests/test_api.py              16 个端到端测试
 tests/test_batch_trace.py      22 个逐批追溯/补录传播回归测试
 tests/test_print_batches.py    21 个印刷批次领用放行/冻结/处置回归测试
-tests/test_genealogy.py        11 个投料谱系/更正波及/撤销流水测试
+tests/test_genealogy.py        14 个投料谱系/更正波及/撤销流水/并发幂等测试
 ```

@@ -96,12 +96,19 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             raise HTTPException(404, f"原料 {ingredient_id} 不存在")
         if store.get_version(ingredient_id, body.version):
             raise HTTPException(409, f"版本 {body.version} 已存在；规格版本不可变，请登记新版本号")
+        if body.corrects_version is not None:
+            if body.corrects_version == body.version:
+                raise HTTPException(422, "被更正规格不能与新版本相同")
+            if store.get_version(ingredient_id, body.corrects_version) is None:
+                raise HTTPException(
+                    422, f"被更正规格版本 {body.corrects_version} 不存在")
         ver = store.add_ingredient_version(
             ingredient_id, body.version,
             [s.model_dump() for s in body.sub_components],
             [d.model_dump() for d in body.supplier_declarations],
         )
-        impact = genealogy.correction_impact(store, ingredient_id, body.version)
+        impact = genealogy.correction_impact(store, ingredient_id, body.version,
+                                             corrects_version=body.corrects_version)
         return {"version": ver, **impact}
 
     @app.post("/products", status_code=201, tags=["资料登记"])
@@ -668,29 +675,31 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                    "items": sorted(({"lot_id": i.lot_id, "quantity": i.quantity}
                                     for i in body.items),
                                    key=lambda x: (x["lot_id"], x["quantity"]))}
-        prior = store.allocation_request_by_key(body.idempotency_key)
-        if prior is not None:
-            if prior["batch_id"] != batch_id or prior["payload"] != payload:
-                raise HTTPException(
-                    409, {"error": "幂等键重复但请求内容不一致，已扣量不可倒扣",
-                          "idempotency_key": body.idempotency_key,
-                          "original": prior["payload"],
-                          "conflicting": payload})
+        # 幂等检查、门禁与扣量写入在同一事务内原子完成
+        outcome = genealogy.allocate_lots_atomic(
+            store, batch, body.idempotency_key, payload,
+            [i.model_dump() for i in body.items])
+        if outcome["outcome"] == "conflict":
+            prior = outcome["prior"]
+            raise HTTPException(
+                409, {"error": "幂等键重复但请求内容不一致，已扣量不可倒扣",
+                      "idempotency_key": body.idempotency_key,
+                      "original": prior["payload"],
+                      "conflicting": payload})
+        if outcome["outcome"] == "reused":
+            prior = outcome["prior"]
             response.status_code = 200
             return {"request_id": prior["request_id"], "batch_id": batch_id,
                     "allocations": [store.get_allocation(a)
                                     for a in prior["allocation_ids"]],
                     "reused": True}
-        result = genealogy.evaluate_allocation(
-            store, batch, [i.model_dump() for i in body.items])
-        if result["failures"]:
+        if outcome["outcome"] == "failed":
             raise HTTPException(
-                409, {"error": "投料分配未通过门禁，未扣量", "failures": result["failures"]})
-        created = genealogy.apply_allocation(store, batch, body.idempotency_key,
-                                             payload, result["items"])
+                409, {"error": "投料分配未通过门禁，未扣量",
+                      "failures": outcome["failures"]})
         response.status_code = 201
-        return {"request_id": created["request_id"], "batch_id": batch_id,
-                "allocations": created["allocations"], "reused": False}
+        return {"request_id": outcome["request_id"], "batch_id": batch_id,
+                "allocations": outcome["allocations"], "reused": False}
 
     @app.post("/allocations/{allocation_id}/reverse", tags=["投料谱系"])
     def reverse_allocation(allocation_id: str, body: AllocationReverse,
