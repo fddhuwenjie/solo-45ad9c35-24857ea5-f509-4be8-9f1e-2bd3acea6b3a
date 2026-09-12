@@ -27,6 +27,19 @@ def setup_flour(client, *, wheat="present") -> None:
         "supplier_declarations": [{"allergen": "wheat", "status": wheat}]})
 
 
+def allocate_flour_lot(client, batch, *, lot="LOT-F1", ingredient="FLOUR",
+                       spec="v1", qty=100):
+    """登记到货批号（放行，已存在则复用）并投料到指定批次，锁定规格与配方一致。"""
+    if client.get(f"/lots/{lot}").status_code == 404:
+        client.post("/lots", json={
+            "lot_id": lot, "ingredient_id": ingredient,
+            "supplier_lot_no": f"SUP-{lot}", "spec_version": spec,
+            "quantity_received": 10000, "status": "released"})
+    res = client.post(f"/batches/{batch}/allocations", json={
+        "idempotency_key": f"alloc-{batch}", "items": [{"lot_id": lot, "quantity": qty}]})
+    assert res.status_code == 201, res.text
+
+
 def setup_world(client, *, swab=0.5, started="2026-03-01") -> str:
     """小麦粉(wheat) + L1 产线（前序 B1 含花生）+ B2 清洁/拭子齐全路径关闭。
 
@@ -47,6 +60,8 @@ def setup_world(client, *, swab=0.5, started="2026-03-01") -> str:
         "batch_id": "B2", "product_id": "P", "line_id": "L1", "sequence": 2,
         "started_at": started, "allergens": [],
         "equipment_segments": [{"segment_id": "MIX"}]})
+    # 投料谱系：B2 的用料记录（锁定规格 v1，推导结果与旧回退一致）
+    allocate_flour_lot(client, "B2")
     client.post("/cleaning-programs", json={
         "program_id": "CP", "version": "v1", "line_id": "L1",
         "allergens": ["peanut"], "required_points": ["p1"],
@@ -206,6 +221,7 @@ def test_issue_blocks_product_mismatch_and_unknown_batch(client):
     client.post("/batches", json={
         "batch_id": "BX", "product_id": "P2", "line_id": "L2", "sequence": 1,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    allocate_flour_lot(client, "BX")
     r = issue(client, "PB1", "key-x", batch="BX")
     assert r.status_code == 409
     assert r.json()["detail"]["differences"][0]["path"] == "product_match"
@@ -244,6 +260,7 @@ def test_issue_409_differences_when_current_analysis_drifts(client):
     client.post("/batches", json={
         "batch_id": "B3", "product_id": "P", "line_id": "L1", "sequence": 3,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    allocate_flour_lot(client, "B3")
     r = issue(client, "PB1", "key-drift", batch="B3")
     assert r.status_code == 409
     paths = [d["path"] for d in r.json()["detail"]["differences"]]
@@ -473,6 +490,7 @@ def test_cross_product_issue_derives_from_batch_product_recipe(client):
     client.post("/batches", json={
         "batch_id": "BM", "product_id": "P2", "line_id": "L2", "sequence": 1,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    allocate_flour_lot(client, "BM", lot="LOT-M1", ingredient="MILK")
     register_print_batch(client, lid, pb_id="PBX",
                          applicable_product_ids=["P", "P2"])
     r = issue(client, "PBX", "k-cross", batch="BM")
@@ -502,6 +520,7 @@ def test_cross_product_issue_matching_derivation_succeeds(client):
     client.post("/batches", json={
         "batch_id": "BW", "product_id": "P3", "line_id": "L2", "sequence": 1,
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    allocate_flour_lot(client, "BW")
     register_print_batch(client, lid, pb_id="PBW",
                          applicable_product_ids=["P", "P3"])
     r = issue(client, "PBW", "k-w", batch="BW")

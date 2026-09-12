@@ -409,20 +409,69 @@ def test_supplier_correction_follows_consumption_chain(client):
                                                  ("LOT-S1", "v1", 20)]
 
 
-def test_correction_without_lots_falls_back_to_dependency_impact(client):
-    """未启用批号管理时保持旧的依赖图影响传播。"""
-    setup_world(client)
-    label = make_label(client)
+def test_correction_without_consumption_keeps_material_allocation_gap(client):
+    """P0/B0 无任何到货批号：来源图记证据空白，更正不按依赖图判受影响/未受影响。"""
+    client.post("/ingredients", json={"id": "FLOUR", "name": "小麦粉"})
+    client.post("/ingredients/FLOUR/versions", json={
+        "version": "v1",
+        "supplier_declarations": [{"allergen": "wheat", "status": "present"},
+                                  {"allergen": "milk", "status": "absent"}]})
+    client.post("/lines", json={"id": "L1", "name": "1号线", "allergens_handled": []})
+    client.post("/products", json={"id": "P0", "name": "曲奇"})
+    client.post("/products/P0/recipes", json={
+        "version": "v1",
+        "items": [{"ingredient_ref": "FLOUR", "version": "v1", "percentage": 100}]})
+    client.post("/batches", json={
+        "batch_id": "B0", "product_id": "P0", "line_id": "L1", "sequence": 1,
+        "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    # 登记 FLOUR@v2 前：B0 无投料记录 -> 证据空白，不按当前规格展开
+    graph = client.get("/products/P0/source-graph", params={"batch_id": "B0"}).json()
+    assert graph["derived"]["required"] == {}
+    gaps = [f for f in graph["findings"]
+            if f["detail"].get("missing") == "material_allocation"]
+    assert [f["detail"]["ingredient_id"] for f in gaps] == ["FLOUR"]
+    # 标签同样被证据空白阻断
+    label = client.post("/labels", json={
+        "product_id": "P0", "batch_id": "B0",
+        "copy": {"declared_allergens": ["wheat"]}}).json()
+    assert any(f["detail"].get("missing") == "material_allocation"
+               for f in label["open_blockers"])
     client.post(f"/labels/{label['id']}/submit")
-    client.post(f"/labels/{label['id']}/approve", json={"approved_by": "qa"})
+    assert client.post(f"/labels/{label['id']}/approve",
+                       json={"approved_by": "qa"}).status_code == 409
+
+    # 登记 FLOUR@v2（更正 milk -> present）：不得经规格依赖图传播
     res = client.post("/ingredients/FLOUR/versions", json={
         "version": "v2",
         "supplier_declarations": [{"allergen": "wheat", "status": "present"},
                                   {"allergen": "milk", "status": "present"}]})
+    assert res.status_code == 201
     body = res.json()
-    assert body["correction"] is None
-    assert body["impacted_products"] == ["P"]
-    assert client.get(f"/labels/{label['id']}").json()["stale"] is True
+    # 无扣料关系：不判受影响（不标 stale、不派生修订）
+    assert body["impacted_products"] == [] and body["actions"] == []
+    corr = body["correction"]
+    assert corr["corrected_versions"] == ["v1"]
+    assert corr["affected_lots"] == [] and corr["affected_products"] == []
+    # 也不判未受影响：P0 保留 material_allocation 证据空白
+    assert corr["unaffected_products"] == []
+    assert corr["consumption_unknown"] == [{
+        "product_id": "P0",
+        "unrecorded_batches": ["B0"],
+        "evidence_gap": "material_allocation",
+        "detail": "批次无该原料的有效投料记录，无法证明未消耗被更正规格，"
+                  "不得判为未受影响"}]
+    view = client.get(f"/labels/{label['id']}").json()
+    assert view["status"] == "in_review" and view["stale"] is False
+    # 登记 FLOUR@v2 后：来源图仍记证据空白，不按最新规格展开（milk 不出现）
+    graph = client.get("/products/P0/source-graph", params={"batch_id": "B0"}).json()
+    assert graph["derived"]["required"] == {}
+    assert [f for f in graph["findings"]
+            if f["detail"].get("missing") == "material_allocation"]
+    # 更正事件沿审计轨迹还原
+    events = [e for e in client.get("/events").json()
+              if e["kind"] == "supplier_correction"]
+    assert len(events) == 1
+    assert events[0]["payload"]["consumption_unknown"][0]["product_id"] == "P0"
 
 
 # -------------------------------------------------------------- 撤销分配

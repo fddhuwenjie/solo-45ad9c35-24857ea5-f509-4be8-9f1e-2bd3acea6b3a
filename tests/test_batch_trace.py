@@ -79,6 +79,17 @@ def gap_codes(path):
     return [g["code"] for g in path["evidence_gaps"]]
 
 
+def allocate_flour_lot(client, batch="B2", lot="LOT-F1"):
+    """登记 FLOUR 到货批号并投料到指定批次（锁定规格 v1，推导结果不变）。"""
+    client.post("/lots", json={
+        "lot_id": lot, "ingredient_id": "FLOUR", "supplier_lot_no": f"SUP-{lot}",
+        "spec_version": "v1", "quantity_received": 1000, "status": "released"})
+    res = client.post(f"/batches/{batch}/allocations", json={
+        "idempotency_key": f"alloc-{batch}-{lot}",
+        "items": [{"lot_id": lot, "quantity": 100}]})
+    assert res.status_code == 201, res.text
+
+
 # -------------------------------------------------------------- 登记入口与校验
 
 def test_batch_registration_validation(client):
@@ -334,6 +345,7 @@ def test_label_persists_batch_id_and_closed_path_allows_free_from(client):
     setup_flour(client)
     setup_line_with_product(client)
     make_batches(client)
+    allocate_flour_lot(client)
     make_program(client)
     make_cleaning(client)
     client.post("/swabs", json={
@@ -414,6 +426,7 @@ def approve_label_with_frozen_evidence(client) -> str:
     setup_flour(client)
     setup_line_with_product(client)
     make_batches(client)
+    allocate_flour_lot(client)
     make_program(client)
     make_cleaning(client)
     client.post("/swabs", json={
@@ -446,6 +459,7 @@ def test_negative_backfill_reopens_then_resolves_finding_on_draft(client):
     setup_flour(client)
     setup_line_with_product(client)
     make_batches(client)
+    allocate_flour_lot(client)
     make_program(client)
     make_cleaning(client)
     client.post("/swabs", json={
@@ -511,6 +525,7 @@ def test_positive_backfill_propagates_through_rework_chain(client):
         "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
     client.post("/rework-paths", json={
         "source_batch_id": "B1", "target_batch_id": "B3", "percentage": 3})
+    allocate_flour_lot(client, batch="B3")
     make_program(client, program_id="CP1", line="L1")
     make_program(client, program_id="CP3", line="L2")
     # B1（L1）与 B3（L2）起初均无清洁记录 -> 两条链都开放，标签不可批准；

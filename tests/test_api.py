@@ -55,6 +55,19 @@ def seed_base(client: TestClient) -> str:
         "batch_id": "B02", "product_id": "COOKIE", "line_id": "L1", "sequence": 2,
         "allergens": [],
         "equipment_segments": [{"segment_id": "MIX", "name": "搅拌段"}]})
+    # 投料谱系：B02 的用料记录（锁定规格与当前规格一致，推导结果不变）
+    for lot_id, ing, ver in (("LOT-FLOUR", "FLOUR", "v1"),
+                             ("LOT-CHOC", "CHOC", "v2"),
+                             ("LOT-SUGAR", "SUGAR", "v1")):
+        client.post("/lots", json={
+            "lot_id": lot_id, "ingredient_id": ing, "supplier_lot_no": f"SUP-{lot_id}",
+            "spec_version": ver, "quantity_received": 1000, "status": "released"})
+    res = client.post("/batches/B02/allocations", json={
+        "idempotency_key": "seed-b02",
+        "items": [{"lot_id": "LOT-FLOUR", "quantity": 55},
+                  {"lot_id": "LOT-CHOC", "quantity": 40},
+                  {"lot_id": "LOT-SUGAR", "quantity": 5}]})
+    assert res.status_code == 201, res.text
     return "COOKIE"
 
 
@@ -272,47 +285,65 @@ def test_alias_mixing_detected(client):
 
 def test_spec_update_marks_impacted_and_derives_revision(client):
     seed_base(client)
-    # 第二个产品共用大豆磷脂，验证波及范围
+    # CANDY 直接消耗 LEC 批号；COOKIE 仅经复合原料间接引用 LEC（无 LEC 投料记录）
+    client.post("/lines", json={"id": "L2", "name": "2号线", "allergens_handled": []})
     client.post("/products", json={"id": "CANDY", "name": "软糖"})
     client.post("/products/CANDY/recipes", json={
         "version": "v1", "items": [{"ingredient_ref": "LEC", "percentage": 3},
                                    {"ingredient_ref": "SUGAR", "version": "v1",
                                     "percentage": 97}]})
-    label = make_label(client, "COOKIE", GOOD_COPY)
+    client.post("/batches", json={
+        "batch_id": "CB1", "product_id": "CANDY", "line_id": "L2", "sequence": 1,
+        "allergens": [], "equipment_segments": [{"segment_id": "MIX"}]})
+    client.post("/lots", json={
+        "lot_id": "LOT-LEC", "ingredient_id": "LEC", "supplier_lot_no": "SUP-LOT-LEC",
+        "spec_version": "v1", "quantity_received": 200, "status": "released"})
+    res = client.post("/batches/CB1/allocations", json={
+        "idempotency_key": "seed-cb1",
+        "items": [{"lot_id": "LOT-LEC", "quantity": 3},
+                  {"lot_id": "LOT-SUGAR", "quantity": 97}]})
+    assert res.status_code == 201, res.text
+    label = make_label(client, "CANDY", {"declared_allergens": ["soy"]})
     approve_ok(client, label["id"])
+    cookie_label = make_label(client, "COOKIE", GOOD_COPY)
+    approve_ok(client, cookie_label["id"])
     approvals_before = client.get(f"/labels/{label['id']}").json()["approvals"]
     assert len(approvals_before) == 1
 
-    # 供应商更换：大豆磷脂新规格声明 soy=absent
+    # 供应商更正：大豆磷脂新规格声明 soy=absent（被更正规格缺省取 v1）
     res = client.post("/ingredients/LEC/versions", json={
         "version": "v2",
         "supplier_declarations": [{"allergen": "soy", "status": "absent",
                                    "source": "SUP-DECL-101"}]})
     assert res.status_code == 201
     body = res.json()
-    assert set(body["impacted_products"]) == {"COOKIE", "CANDY"}
+    # 只沿被更正规格批号的扣料关系传播：CANDY 消耗过 LOT-LEC@v1
+    assert body["impacted_products"] == ["CANDY"]
     actions = {(a["product_id"], a["action"]) for a in body["actions"]}
-    assert ("COOKIE", "derived_new_revision") in actions
+    assert ("CANDY", "derived_new_revision") in actions
+    corr = body["correction"]
+    assert corr["corrected_versions"] == ["v1"]
+    assert [l["lot_id"] for l in corr["affected_lots"]] == ["LOT-LEC"]
+    assert corr["declaration_changes"] == [
+        {"spec_version": "v1", "allergen": "soy",
+         "old_status": "present", "new_status": "absent"}]
+    # COOKIE 的批次无 LEC 投料记录：不得判为受影响或未受影响，保留证据空白
+    assert [u["product_id"] for u in corr["consumption_unknown"]] == ["COOKIE"]
+    assert corr["consumption_unknown"][0]["evidence_gap"] == "material_allocation"
 
     old = client.get(f"/labels/{label['id']}").json()
     assert old["status"] == "approved" and old["stale"] is True
     # 批准记录保持只读：仍是原来那一条，快照未变
     assert client.get(f"/labels/{label['id']}").json()["approvals"] == approvals_before
-    # 派生的新修订为草稿，且按新资料重新推导（soy 不再是应声明项）
+    # 派生的新修订为草稿；投料规格仍锁定 v1，推导不悄悄采用新规格
     new_label = next(a for a in body["actions"]
                      if a["action"] == "derived_new_revision")
     rev2 = client.get(f"/labels/{new_label['label_id']}").json()
     assert rev2["revision"] == 2 and rev2["status"] == "draft"
-    assert set(rev2["derived"]["required"]) == {"wheat"}
-
-    # 比较两版：soy 被移除，波及到共用 LEC 的 CANDY
-    cmp_res = client.get("/products/COOKIE/labels/compare",
-                         params={"from_revision": 1, "to_revision": 2})
-    assert cmp_res.status_code == 200
-    diff = cmp_res.json()
-    assert diff["required"] == {"added": [], "removed": ["soy"]}
-    assert diff["changed_ingredients"] == ["LEC"]
-    assert any(p["product_id"] == "CANDY" for p in diff["impact_scope"])
+    assert set(rev2["derived"]["required"]) == {"soy"}
+    # COOKIE 未被波及：标签保持原状态
+    cookie_view = client.get(f"/labels/{cookie_label['id']}").json()
+    assert cookie_view["status"] == "approved" and cookie_view["stale"] is False
 
 
 def test_recipe_update_marks_label_stale(client):

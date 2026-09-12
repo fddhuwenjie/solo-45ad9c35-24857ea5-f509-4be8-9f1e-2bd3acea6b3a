@@ -38,36 +38,21 @@ GATE_CODES = (
 )
 
 
-def locked_specs_for_batch(store, batch_id: str) -> dict | None:
+def locked_specs_for_batch(store, batch_id: str) -> dict:
     """批次开工时锁定的投料规格：ingredient_id -> [{lot_id, spec_version, quantity}]。
 
-    批次存在有效（未撤销）投料记录时返回映射——未覆盖的配方项由展开层记
-    证据空白。批次完全没有有效投料记录时：只要配方中任一原料已启用批号
-    管理（存在到货批号），即返回空映射进入严格模式，逐项记
-    material_allocation 证据空白，不得回退当前/最新规格；仅当配方原料
-    均未启用批号管理时返回 None，保持旧的现行规格展开。
+    批次没有任何有效（未撤销）投料记录时返回空映射——展开层对每个顶层
+    配方项记 material_allocation 证据空白，不得按当前/最新规格展开，
+    即使该原料从未建立到货批号。
     """
-    allocations = store.allocations_for_batch(batch_id, active_only=True)
-    if allocations:
-        locked: dict[str, list] = {}
-        for a in allocations:
-            locked.setdefault(a["ingredient_id"], []).append({
-                "lot_id": a["lot_id"],
-                "spec_version": a["spec_version"],
-                "quantity": a["quantity"],
-            })
-        return locked
-    batch = store.get_batch(batch_id)
-    if batch is None:
-        return None
-    recipe = store.current_recipe(batch["product_id"])
-    if recipe is None:
-        return None  # 缺配方本身已有 data_gap，保持旧回退
-    for item in recipe["items"]:
-        ing, err, _ = resolve_ref(store, item["ingredient_ref"])
-        if ing is not None and store.lots_for_ingredient(ing["id"]):
-            return {}  # 已启用批号管理但批次无有效投料记录 -> 严格模式
-    return None
+    locked: dict[str, list] = {}
+    for a in store.allocations_for_batch(batch_id, active_only=True):
+        locked.setdefault(a["ingredient_id"], []).append({
+            "lot_id": a["lot_id"],
+            "spec_version": a["spec_version"],
+            "quantity": a["quantity"],
+        })
+    return locked
 
 
 # ---------------------------------------------------------------------- 分配门禁
@@ -233,20 +218,14 @@ def correction_impact(store, ingredient_id: str, new_version: str,
     本次更正明确关联被更正的旧规格（`corrects_version`；缺省取登记前最新
     版本）：只沿该旧规格对应批号的实际扣料关系传播——消耗过这些批号的
     批次、标签修订与已发放卷标进入波及链，其他规格批号不纳入
-    `affected_lots`。引用该原料但批次无有效投料记录的产品无法证明未消
-    耗，列入 `consumption_unknown`（material_allocation 证据空白），
-    不得判为未受影响；只有每个批次都能以投料记录证明未消耗被更正规格的
-    产品才进入 `unaffected_products`。原料尚无到货批号时回退旧的依赖图
-    影响传播。
+    `affected_lots`。分类只认投料证据，不再走规格依赖图：每个批次都能
+    以投料记录证明未消耗被更正规格的产品才进入 `unaffected_products`；
+    批次无有效投料记录的产品（即使该原料从未建立到货批号）列入
+    `consumption_unknown`（material_allocation 证据空白），既不得判为
+    受影响，也不得判为未受影响。
     """
     lots = store.lots_for_ingredient(ingredient_id)
     reason = f"供应商更正 {ingredient_id} 过敏原声明（新规格 {ingredient_id}@{new_version}）"
-    if not lots:
-        impacted = engine.impacted_products(store, [ingredient_id])
-        actions = engine.apply_impact(store, impacted,
-                                      reason=f"新规格版本 {ingredient_id}@{new_version}")
-        return {"impacted_products": sorted(impacted), "actions": actions,
-                "correction": None}
 
     # 本次被更正的旧规格：显式指定，缺省取登记前最新版本
     if corrects_version is not None:
@@ -255,6 +234,9 @@ def correction_impact(store, ingredient_id: str, new_version: str,
         previous = [v["version"] for v in store.versions_of(ingredient_id)
                     if v["version"] != new_version]
         corrected_versions = previous[-1:] if previous else []
+    if not corrected_versions:
+        # 首个规格版本：无被更正对象，不构成更正事件，也不产生任何影响
+        return {"impacted_products": [], "actions": [], "correction": None}
 
     new_ver = store.get_version(ingredient_id, new_version)
     new_decls = new_ver["supplier_declarations"] if new_ver else []
