@@ -20,7 +20,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（95 个，含 22 个包装执行测试）
+python -m pytest tests/                        # 端到端测试（124 个，含成品换标处置测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -37,6 +37,8 @@ python -m pytest tests/                        # 端到端测试（95 个，含 
 到货批号 ─> 投料分配(锁定规格/扣量流水) ─> 供应商更正沿扣料关系波及
 标签文案 ───────────────────────────────> 比对 ──> 批准/阻断
 印刷批次 ─> 领用放行(逐项对照) ─> 包装运行(清场/开工绑定) ─> 用标事件 ─> 卷标结算
+撤回/更正/阳性传播 ─> 圈定受影响批次 ─> 换标处置单(锁定原包装/登记箱托标识/指定新标新卷标)
+                  └> 审核(重算声明+逐项比对+预留新卷标) ─> 拆标/重贴/报废/抽检/放行 ─> 结案核平
 ```
 
 ## 逐批次追溯
@@ -156,6 +158,18 @@ swab:{swab_id}                                 拭子结果
 5. **撤回/更正波及**：标签撤回或供应商规格更正触发影响传播时，`print_freeze` 按生产批次列出未结算现场余量（领出未上线 + 未结算运行的线边余量，**按实时对账判定**——仅当前仍满足两条结算等式的已结算运行才视为现场余量清零）、已包装数量（贴用量与合格品数）与 `pending_isolation_batches` 待隔离批次；已包装成品始终进入处置评估。
 6. 审计串联：核对包 `packaging_execution` 汇总该标签修订下全部包装运行（清场发现、用标/调整事件、结算记录与实时对账）及波及清单；批次查询带 `packaging_runs`；审查单含包装执行小节；事件日志记录 `packaging_run_started / packaging_event_recorded / packaging_run_settled / packaging_run_reopened`。
 
+## 成品换标处置
+
+批准文案在产品装箱后才失效（标签撤回 / 规格更正 / 阳性拭子传播），补救过程（哪些托盘拦下、哪些外箱换标）以换标处置单落成可审计、可核平的记录：
+
+1. `POST /relabel-dispositions` 开立处置单：只能引用撤回 / 规格更正 / 阳性传播实际圈出的**受影响批次**（凭手工输入的批次 `batch_not_affected` 拒绝）；逐项登记外箱（`case`）/托盘（`pallet`）标识与件数，同单重复或被其他在办处置占用的标识拒绝；创建即**锁定该批次全部原包装运行**（锁只增不删，处置期间与结案后原包装的用标事件/调整/结算/再开工一律 409）；指定候选新标签修订（须 approved、无 stale、产品一致）与候选新卷标印刷批次（须属于该修订）。
+2. `POST /relabel-dispositions/{id}/review` 审核：重算该批次过敏原声明，逐项比对新标签**批准快照**与印刷文案、当前推导声明，并拦截新增开放 blocker；未隔离（`not_isolated`）、标识被其他处置占用（`identifier_occupied`）、声明不符（`declaration_mismatch`）、印刷文案不符（`printed_copy_mismatch`）、候选修订失效、卷标冻结/失效（`print_batch_unavailable`）或卷标余量不足（`insufficient_label_quantity`）均不得开工。通过即开启审核轮次（epoch）、按隔离件数**预留新卷标**（从印刷批次可领用余量扣除），并冻结审核快照（批准文案、印刷摘要、逐项核对、分析版本）。
+3. `POST /relabel-dispositions/{id}/events` 处置事件（幂等键追加，只增不改）：`removed` 拆标 → `relabelled` 重贴合格（按 件数×每件用标数 消耗预留新卷标）/ `scrapped` 报废；`inspection_failed` 抽检失败（冲减合格件、回待处置池返工，不能放行）；`released` 放行。门禁保证先拆标再处置、不超隔离件数、不超预留、重贴时印刷批次仍可用。
+4. `POST /relabel-dispositions/{id}/close` 结案须同时核平：**「隔离件数 = 换标合格 + 报废 + 仍隔离」**（仍隔离含未拆标/抽检失败待返工件）与**「预留卷标 = 重贴消耗 + 结案退回」**（未消耗预留退回印刷批次可领用余量），且换标合格件全部放行；结案快照 append-only，处置单置 `closed` 后全程只读（事件/重审/改指定/再结案均拒绝）。
+5. **在办失效与重审继承**：规则或标签再变动（撤回 / 规格更正 / 阳性传播 / 候选印刷批次冻结）时，在办（draft/approved）处置单置 `invalidated`，未消耗预留退回可领用余量，响应列出**待复核标识**。`PUT /relabel-dispositions/{id}/candidate` 可改指定候选修订/印刷批次后重审（epoch+1）。**报废与放行是跨轮不可逆实物结果**：重审继承此前各轮已报废件（不恢复为仍隔离、不能再次拆标或报废）与已放行件；上轮换标后未放行、因失效回流的件回到处置池可重新拆标重贴；重审预留只覆盖剩余可处置件。每轮事件独立记账（带 epoch），历史事件与审核快照全部保留。
+6. **预留与余量**：印刷批次可领用余量 = 入库 − 领用 − 处置 − 未消耗预留（已重贴消耗部分永久出库不回补，结案/失效只退回未消耗预留）；入库量恰好等于预留量时印刷批次**不**因占满变 `closed`，首笔重贴可正常消耗；仅在无未消耗预留且实物余量归零时数据层兜底呈现 `closed`。
+7. 审计串联：`GET /relabel-dispositions/{id}` 完整视图（标识/各轮事件/审核/结案/运行锁/卷标账/实时核平）；`GET /relabel-dispositions/{id}/audit-export` 串起**原包装**（受影响批次包装运行、用标账、锁定）、**换标去向**与**修订链**（每轮候选修订可直接还原 `reviews[].candidate_label`，`label_ledger` 保留不同印刷批次的分轮预留/消耗/退回明细）；批次详情带处置单与运行锁；标签核对包含 `relabel_disposition`（as_new_label / as_old_label），审查单含换标处置小节；事件日志记录 `relabel_disposition_created / relabel_review_approved / relabel_event_recorded / relabel_disposition_invalidated / relabel_disposition_closed`。
+
 ## 主要接口
 
 | 方法 | 路径 | 说明 |
@@ -182,7 +196,11 @@ swab:{swab_id}                                 拭子结果
 | POST | `/packaging-runs` · GET `/packaging-runs/{id}` | 包装运行开工登记（清场 + 门禁）/ 运行完整视图 |
 | POST | `/packaging-runs/{id}/events` · `/{id}/adjustments` | 用标事件（幂等，贴用/损耗/留样/退回隔离）/ 盘点更正调整 |
 | POST | `/packaging-runs/{id}/settle` · GET `/packaging-runs/{id}/reconciliation` | 卷标结算（双等式平衡）/ 实时对账 |
-| GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引与印刷放行控制） |
+| POST | `/relabel-dispositions` · GET（可按 `status`/`batch_id` 过滤） | 成品换标处置单（引用受影响批次、锁定原包装、登记标识、指定候选新标/新卷标） |
+| POST | `/relabel-dispositions/{id}/review` · PUT `/{id}/candidate` | 审核（重算过敏原声明、逐项比对、预留新卷标）/ 失效后改指定候选重审 |
+| POST | `/relabel-dispositions/{id}/events` · `/{id}/close` | 处置事件（幂等：拆标/重贴/报废/抽检失败/放行）/ 结案双等式核平（只读） |
+| GET | `/relabel-dispositions/{id}` · `/{id}/audit-export` | 处置单完整视图（各轮事件/审核/结案/锁/卷标账）/ 审计导出（原包装→换标去向→修订链） |
+| GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引、印刷放行控制与换标处置） |
 | GET | `/labels/{id}/review-sheet` | 可打印审查单（HTML，含追溯小节） |
 | GET | `/samples/compound-coline` | 复合原料 + 共线冲突请求样例 |
 | GET | `/events` | 审计事件日志 |
@@ -201,6 +219,7 @@ label_audit/
   trace.py    逐批次追溯：路径开闭、返工链、批准快照证据
   printing.py 印刷批次：文案规范化摘要、放行逐项对照、影响冻结
   packaging.py 包装执行：开工门禁、幂等用标事件、双等式结算、盘点更正、撤回波及清单
+  relabeling.py 成品换标处置：处置单、审核重算、幂等处置事件、双等式结案、在办失效与跨轮继承、审计导出
   genealogy.py 投料谱系：分配门禁、锁定规格、更正波及链、反向流水
   db.py       SQLite 持久层（approvals 只读）
   report.py   JSON 核对包 / 可打印审查单
@@ -209,4 +228,5 @@ tests/test_api.py              16 个端到端测试
 tests/test_batch_trace.py      22 个逐批追溯/补录传播回归测试
 tests/test_print_batches.py    21 个印刷批次领用放行/冻结/处置回归测试
 tests/test_genealogy.py        14 个投料谱系/更正波及/撤销流水/并发幂等测试
+tests/test_relabeling.py       26 个成品换标处置（审核门禁/幂等事件/双等式结案/在办失效跨轮继承/审计导出）回归测试
 ```

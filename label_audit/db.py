@@ -326,6 +326,8 @@ CREATE TABLE IF NOT EXISTS relabel_reviews (
     disposition_id TEXT NOT NULL,
     epoch INTEGER NOT NULL,
     reviewer TEXT NOT NULL,
+    new_label_id TEXT,
+    new_print_batch_id TEXT,
     analysis_version TEXT NOT NULL,
     approved_copy_snapshot TEXT NOT NULL,
     print_copy_summary TEXT NOT NULL,
@@ -417,7 +419,17 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate_columns()
         self.conn.commit()
+
+    def _migrate_columns(self) -> None:
+        """旧库轻量列迁移：为既有换标审核快照补候选标签/印刷批次列。"""
+        existing = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(relabel_reviews)").fetchall()}
+        for col in ("new_label_id", "new_print_batch_id"):
+            if col not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE relabel_reviews ADD COLUMN {col} TEXT")
 
     # ------------------------------------------------------------------ 基础
     def _q(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -1171,15 +1183,17 @@ class Store:
         reserved = self.reserved_quantity(r["print_batch_id"])
         consumed = self.reserved_consumed_quantity(r["print_batch_id"])
         returned = self.reserved_returned_quantity(r["print_batch_id"])
+        # 未消耗预留（在办处置单占住、结案/失效会退回）；已重贴消耗部分不回补
+        outstanding = reserved - consumed - returned
         received = r["quantity_received"]
         status = r["status"]
-        # 可领用余量 = 入库 - 领用 - 处置 - 换标预留 + 预留退回；
-        # 已被重贴消耗的预留始终不回补（预留 = 消耗 + 退回 + 未用）
+        # 可领用余量 = 入库 - 领用 - 处置 - 预留 + 预留退回。
+        # 退回只回补未消耗预留；已重贴消耗部分（= 预留-退回-未消耗）不回补。
         remaining = received - issued - disposed - reserved + returned
-        # 余量因领用/消耗归零而状态未及更新时，对外呈现为 closed（数据层兜底）。
-        # 仅被未消耗预留占满不算 closed：预留来自在办处置单，结案退回后仍可领用。
-        if received - issued - disposed - (reserved - returned) == 0 \
-                and status == "available":
+        # 数据层兜底结案：可领用余量为零且无未消耗预留（不会再有退回）时才
+        # 呈现 closed。仅被预留占满（哪怕入库量恰好等于预留量）不算 closed——
+        # 预留来自在办处置单，首笔重贴要能正常消耗。
+        if outstanding == 0 and remaining == 0 and status == "available":
             status = "closed"
         return {
             "print_batch_id": r["print_batch_id"],
@@ -1837,10 +1851,11 @@ class Store:
         with self.transaction():
             self._exec(
                 "INSERT INTO relabel_reviews (disposition_id, epoch, reviewer,"
-                " analysis_version, approved_copy_snapshot, print_copy_summary,"
-                " basis_derived, item_checks, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (disposition_id, epoch, reviewer, review["analysis_version"],
+                " new_label_id, new_print_batch_id, analysis_version,"
+                " approved_copy_snapshot, print_copy_summary, basis_derived,"
+                " item_checks, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (disposition_id, epoch, reviewer, review["new_label_id"],
+                 review["new_print_batch_id"], review["analysis_version"],
                  json.dumps(review["approved_copy"], ensure_ascii=False),
                  json.dumps(review["print_summary"], ensure_ascii=False),
                  json.dumps(review["basis_derived"], ensure_ascii=False),
@@ -1867,6 +1882,8 @@ class Store:
         return [
             {"id": r["id"], "disposition_id": r["disposition_id"],
              "epoch": r["epoch"], "reviewer": r["reviewer"],
+             "new_label_id": r["new_label_id"],
+             "new_print_batch_id": r["new_print_batch_id"],
              "analysis_version": r["analysis_version"],
              "approved_copy_snapshot": _loads(r["approved_copy_snapshot"], {}),
              "print_copy_summary": _loads(r["print_copy_summary"], {}),
@@ -1885,6 +1902,8 @@ class Store:
         if r is None:
             return None
         return {"id": r["id"], "epoch": r["epoch"], "reviewer": r["reviewer"],
+                "new_label_id": r["new_label_id"],
+                "new_print_batch_id": r["new_print_batch_id"],
                 "analysis_version": r["analysis_version"],
                 "approved_copy_snapshot": _loads(r["approved_copy_snapshot"], {}),
                 "print_copy_summary": _loads(r["print_copy_summary"], {}),

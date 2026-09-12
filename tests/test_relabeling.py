@@ -374,9 +374,11 @@ def test_relabel_consumes_labels_per_unit(client):
     assert res.status_code == 201
     assert res.json()["event"]["labels_used"] == 80
     pb = client.get("/print-batches/PB-NEW").json()
-    # 预留 160（80 件 × 2），已消耗 80
+    # 预留 160（80 件 × 2），已消耗 80、未消耗预留 80 仍占用可领用余量
     assert pb["reserved_outstanding_quantity"] == 80
+    assert pb["reserved_consumed_quantity"] == 80
     assert pb["remaining_quantity"] == 840
+    assert pb["status"] == "available"  # 被预留占满不误判 closed
 
 
 def test_event_idempotency_replay_and_conflict(client):
@@ -460,8 +462,12 @@ def test_close_balances_units_and_labels(client):
     assert lb["labels_consumed"] == 70
     assert lb["returned_quantity"] == 10
     assert body["closure"]["snapshot"]["reconciliation"]["epoch"] == 1
-    # 未消耗预留恢复印刷批次可领用余量
+    # 结案后：70 枚重贴消耗永久出库，10 枚未消耗预留退回可领用
     pb = client.get("/print-batches/PB-NEW").json()
+    assert pb["reserved_consumed_quantity"] == 70
+    assert pb["reserved_returned_quantity"] == 10
+    assert pb["reserved_outstanding_quantity"] == 0
+    # 可领用余量：入库 1000 - 重贴永久消耗 70 = 930（退回 10 已回补）
     assert pb["remaining_quantity"] == 930
     assert len(body["disposition"]["closures"]) == 1
 
@@ -681,3 +687,164 @@ def test_reserved_labels_block_normal_issuance(client):
     assert res.status_code == 409
     diffs = res.json()["detail"].get("differences", [])
     assert any(d.get("path") == "remaining_quantity" for d in diffs)
+
+
+# -------------------------------------------------------------- 三处已复核缺陷的回归
+
+def test_regression_print_batch_filled_by_reservation_not_closed(client):
+    """缺陷1：入库量恰好等于审核预留量时，PB 不应因预留占满变 closed，
+    首笔重贴应能正常消耗预留卷标。"""
+    world = setup_world(client)
+    issue_and_run(client, world["old_label"])
+    # 新印刷批次入库量恰好 = 隔离件数 80（labels_per_unit=1）
+    withdraw_old_and_prepare_new(client, world, pb_qty=80)
+    res = create_disposition(client, "DEP1", labels_per_unit=1)
+    assert res.status_code == 201, res.text
+    review_ok(client)
+    pb = client.get("/print-batches/PB-NEW").json()
+    # 被预留占满：可领用余量 0，但仍是 available（不是 closed）
+    assert pb["status"] == "available"
+    assert pb["remaining_quantity"] == 0
+    assert pb["reserved_quantity"] == 80
+    assert pb["reserved_outstanding_quantity"] == 80
+    # 首笔重贴正常消耗预留，不被 closed/不可用门禁拦截
+    dep = client.get("/relabel-dispositions/DEP1").json()
+    plt = [i for i in dep["items"] if i["identifier"] == "PLT-01"][0]["item_id"]
+    event(client, "DEP1", plt, "r1", "removed", 40)
+    r = event(client, "DEP1", plt, "l1", "relabelled", 40)
+    assert r.status_code == 201, r.text
+    assert r.json()["event"]["labels_used"] == 40
+    pb2 = client.get("/print-batches/PB-NEW").json()
+    assert pb2["status"] == "available"
+    assert pb2["reserved_consumed_quantity"] == 40
+    assert pb2["reserved_outstanding_quantity"] == 40
+
+
+def test_regression_rereview_inherits_irreversible_scrap(client):
+    """缺陷2：失效后重审继承此前 epoch 的不可逆实物结果。已报废件不恢复为
+    仍隔离，也不能再次拆标或报废；重审预留只覆盖剩余可处置件。"""
+    world = setup_world(client)
+    dep, items = _approved_with_items(client, world)
+    plt = items["PLT-01"]  # 40 件
+    # 第 1 轮：拆 40、报废 20、重贴 20 放行 20
+    event(client, "DEP1", plt, "r1", "removed", 40)
+    event(client, "DEP1", plt, "s1", "scrapped", 20, reason="浸湿报废")
+    event(client, "DEP1", plt, "l1", "relabelled", 20)
+    event(client, "DEP1", plt, "ok1", "released", 20)
+    # 规则再变动使处置失效
+    r = client.post("/ingredients/FLOUR/versions", json={
+        "version": "v2", "corrects_version": "v1",
+        "supplier_declarations": [
+            {"allergen": "wheat", "status": "present"},
+            {"allergen": "peanut", "status": "may_contain"}]})
+    assert r.status_code == 201, r.text
+    d = client.get("/relabel-dispositions/DEP1").json()
+    assert d["status"] == "invalidated"
+    st1 = [s for s in d["reconciliation"]["items"]
+           if s["item_id"] == plt][0]
+    # 报废件与放行件作为不可逆实物结果保留；该件上仍隔离为 0
+    assert st1["total_scrapped_units"] == 20
+    assert st1["total_released_units"] == 20
+    assert st1["still_quarantined_units"] == 0
+    # 批准更正传播派生的修订并登记新印刷批次 PB3（旧 PB-NEW 已冻结）
+    lid = [l for l in client.get("/products/P/impact").json()["labels"]
+           if l["status"] == "draft"][-1]["label_id"]
+    client.post(f"/labels/{lid}/submit")
+    assert client.post(f"/labels/{lid}/approve",
+                       json={"approved_by": "qa.lead"}).status_code == 200
+    register_print_batch(client, lid, "PB3", qty=1000)
+    assert client.put("/relabel-dispositions/DEP1/candidate", json={
+        "new_label_id": lid, "new_print_batch_id": "PB3"}).status_code == 200
+    # 重审预留只覆盖另一件 CS-02（40 件）：PLT-01 已全在不可逆终态
+    d2 = review_ok(client)
+    assert d2["current_epoch"] == 2
+    assert d2["reconciliation"]["label_balance"]["reserved_quantity"] == 40
+    st2 = [s for s in d2["reconciliation"]["items"]
+           if s["item_id"] == plt][0]
+    assert st2["available_base_units"] == 0
+    assert st2["total_scrapped_units"] == 20
+    # 已报废件不能再次拆标
+    rr = event(client, "DEP1", plt, "r2", "removed", 1)
+    assert rr.status_code == 409
+    assert rr.json()["detail"]["failures"][0]["code"] == "removed_limit_exceeded"
+    # 也不能再次报废（无待处置件）
+    rs = event(client, "DEP1", plt, "s2", "scrapped", 1)
+    assert rs.status_code == 409
+    # 剩余可处置的 CS-02 第 2 轮走完全程
+    cs = [i for i in d2["items"] if i["identifier"] == "CS-02"][0]["item_id"]
+    event(client, "DEP1", cs, "rc", "removed", 40)
+    event(client, "DEP1", cs, "lc", "relabelled", 40)
+    event(client, "DEP1", cs, "okc", "released", 40)
+    closed = client.post("/relabel-dispositions/DEP1/close",
+                         json={"closed_by": "qa.final"})
+    assert closed.status_code == 200, closed.text
+    rec = closed.json()["reconciliation"]
+    # 结案恒等式继承第 1 轮报废：80 = 60 合格 + 20 报废 + 0 仍隔离
+    ub = rec["unit_balance"]
+    assert ub["relabelled_units"] == 60
+    assert ub["scrapped_units"] == 20
+    assert ub["still_quarantined_units"] == 0
+    assert ub["balanced"] is True
+
+
+def test_regression_review_snapshots_keep_label_revision_per_epoch(client):
+    """缺陷3：每轮 relabel_reviews 保存当轮候选 new_label_id；审计导出能直接
+    还原各轮候选修订，label_ledger 保留 PB2/PB3 分轮记录。"""
+    world = setup_world(client)
+    dep, items = _approved_with_items(client, world, pb_qty=1000)
+    plt = items["PLT-01"]
+    event(client, "DEP1", plt, "r1", "removed", 40)
+    event(client, "DEP1", plt, "l1", "relabelled", 20)
+    epoch1_label = dep["new_label_id"]
+    # 第 1 轮审核快照保存候选修订
+    rv1 = client.get("/relabel-dispositions/DEP1").json()["reviews"][0]
+    assert rv1["new_label_id"] == epoch1_label
+    assert rv1["new_print_batch_id"] == "PB-NEW"
+    # 规格更正在办失效
+    r = client.post("/ingredients/FLOUR/versions", json={
+        "version": "v2", "corrects_version": "v1",
+        "supplier_declarations": [
+            {"allergen": "wheat", "status": "present"},
+            {"allergen": "peanut", "status": "may_contain"}]})
+    assert r.status_code == 201, r.text
+    lid = [l for l in client.get("/products/P/impact").json()["labels"]
+           if l["status"] == "draft"][-1]["label_id"]
+    client.post(f"/labels/{lid}/submit")
+    assert client.post(f"/labels/{lid}/approve",
+                       json={"approved_by": "qa.lead"}).status_code == 200
+    register_print_batch(client, lid, "PB3", qty=1000)
+    client.put("/relabel-dispositions/DEP1/candidate", json={
+        "new_label_id": lid, "new_print_batch_id": "PB3"})
+    review_ok(client)
+    # 审计导出
+    ex = client.get("/relabel-dispositions/DEP1/audit-export").json()
+    reviews = ex["reviews"]
+    assert {rv["epoch"] for rv in reviews} == {1, 2}
+    by_epoch = {rv["epoch"]: rv for rv in reviews}
+    # 各轮候选修订可直接还原，无需借助处置单当前指向
+    assert by_epoch[1]["new_label_id"] == epoch1_label
+    assert by_epoch[1]["candidate_label"]["label_id"] == epoch1_label
+    assert by_epoch[1]["candidate_print_batch"]["print_batch_id"] == "PB-NEW"
+    assert by_epoch[2]["new_label_id"] == lid
+    assert by_epoch[2]["candidate_label"]["label_id"] == lid
+    assert by_epoch[2]["candidate_print_batch"]["print_batch_id"] == "PB3"
+    # label_ledger 保留 PB2(PB-NEW)/PB3 分轮记录
+    ledger = ex["label_ledger"]
+    pbs_epochs = {(e["print_batch_id"], e["epoch"], e["kind"])
+                  for e in ledger}
+    assert ("PB-NEW", 1, "reserved") in pbs_epochs
+    assert ("PB-NEW", 1, "consumed") in pbs_epochs
+    assert ("PB-NEW", 1, "returned") in pbs_epochs  # 失效退回未消耗预留
+    assert ("PB3", 2, "reserved") in pbs_epochs
+    grouped = {(g["print_batch_id"], g["epoch"]): g
+               for g in ex["label_ledger_by_epoch"]}
+    # 第 1 轮：预留 80、消耗 20、失效退回 60
+    assert grouped[("PB-NEW", 1)]["reserved"] == 80
+    assert grouped[("PB-NEW", 1)]["consumed"] == 20
+    assert grouped[("PB-NEW", 1)]["returned"] == 60
+    assert grouped[("PB3", 2)]["reserved"] == 80
+    # 修订链按轮可还原
+    chains = {c["epoch"]: c for c in
+              ex["revision_chain"]["candidate_chains_by_epoch"]}
+    assert chains[1]["new_label_id"] == epoch1_label
+    assert chains[2]["new_label_id"] == lid

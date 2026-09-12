@@ -215,42 +215,101 @@ def create_disposition(store, disposition_id: str, batch: dict, source: dict,
 
 # ---------------------------------------------------------------------- 数量合计与状态
 
-def item_state(store, disposition: dict, item: dict) -> dict:
-    """按当前审核轮次（epoch）的事件账推导标识处置状态。
+def _prior_terminal_units(store, disposition: dict) -> int:
+    """此前各轮已落不可逆终态（报废 + 已放行）的件数合计。
 
-    数量维度：removed 已拆标 / relabelled 换标合格 / scrapped 报废 /
-    failed 抽检失败（仍隔离待返工）/ released 已放行。
-    结案核平：units = relabelled + scrapped + 仍隔离（仍隔离含未拆标与
-    抽检失败件）。
+    重审将开启 current_epoch+1 轮；属于该新轮的事件不计入历史。
+    重审预留新卷标时这些件不进入新一轮处置池；跨轮继承在 item_state 中
+    逐项计算，本函数只给审核预留量提供总量。
     """
-    epoch = disposition["current_epoch"]
-    agg = {k: 0 for k in RELABEL_EVENT_KINDS}
-    labels_consumed = 0
-    for e in store.relabel_events(disposition["disposition_id"], epoch=epoch):
+    new_epoch = disposition["current_epoch"] + 1
+    total = 0
+    for e in store.relabel_events(disposition["disposition_id"]):
+        if e["epoch"] >= new_epoch:
+            continue
+        if e["kind"] in ("scrapped", "released"):
+            total += e["quantity"]
+    return total
+
+
+def _epoch_item_aggregates(store, disposition: dict, item: dict) -> dict:
+    """按 epoch 汇总某标识的处置事件（含实物件数与实际用标量）。"""
+    by_epoch: dict[int, dict] = {}
+    for e in store.relabel_events(disposition["disposition_id"]):
         if e["item_id"] != item["item_id"]:
             continue
-        agg[e["kind"]] += e["quantity"]
-        labels_consumed += e["labels_used"]
-    open_units = item["units"] - agg["removed"]
-    # 抽检失败件冲减当前合格件、回到待处置池（可重新重贴或报废）；
-    # 待处置 = 已拆 - 当前合格 - 已报废
-    good_relabelled = agg["relabelled"] - agg["inspection_failed"]
-    pending = agg["removed"] - good_relabelled - agg["scrapped"]
-    still_quarantined = item["units"] - good_relabelled - agg["scrapped"]
-    unreleased = good_relabelled - agg["released"]
-    if agg["removed"] >= item["units"] and pending == 0 and unreleased == 0 \
+        agg = by_epoch.setdefault(e["epoch"], {
+            "removed": 0, "relabelled": 0, "scrapped": 0,
+            "inspection_failed": 0, "released": 0, "labels_consumed": 0})
+        agg[e["kind"]] = agg.get(e["kind"], 0) + e["quantity"]
+        agg["labels_consumed"] += e["labels_used"]
+    return by_epoch
+
+
+def _epoch_good(agg: dict) -> int:
+    """某轮的当前合格件 = 重贴件 - 该轮抽检失败件（失败回待处置池返工）。"""
+    return max(0, agg.get("relabelled", 0) - agg.get("inspection_failed", 0))
+
+
+def item_state(store, disposition: dict, item: dict) -> dict:
+    """跨审核轮次推导标识处置状态（含此前 epoch 的不可逆实物结果继承）。
+
+    数量维度：removed 已拆标 / relabelled 换标合格 / scrapped 报废 /
+    failed 抽检失败（回待处置返工）/ released 已放行。
+
+    报废与放行是**不可逆实物结果**，跨轮累计继承：已报废件不会恢复为仍隔离，
+    也不能再次拆标或报废；上一轮已放行件同样不进入新一轮处置池。上一轮拆后
+    尚未落终态（未重贴/未报废/抽检失败待返工）的件回到新一轮仍隔离，可再次
+    拆标（新轮已无旧标实物账）与重贴/报废。
+    结案恒等式：units = 累计换标合格 + 累计报废 + 仍隔离。
+    """
+    cur_epoch = disposition["current_epoch"]
+    by_epoch = _epoch_item_aggregates(store, disposition, item)
+
+    # 此前各轮的**不可逆实物结果**：报废与已放行。上轮换标合格但未放行的件
+    # 在处置失效后其新标不再被承认，回到新一轮仍隔离处置池（可再次拆标重贴），
+    # 不属于终态、不阻断新轮处置。
+    prior_scrapped = prior_released = prior_removed = 0
+    for ep, agg in sorted(by_epoch.items()):
+        if ep >= cur_epoch:
+            continue
+        prior_scrapped += agg.get("scrapped", 0)
+        prior_released += agg.get("released", 0)
+        prior_removed += agg.get("removed", 0)
+    cur = by_epoch.get(cur_epoch, {
+        "removed": 0, "relabelled": 0, "scrapped": 0,
+        "inspection_failed": 0, "released": 0, "labels_consumed": 0})
+
+    # 本轮开工时可处置实物池：未报废、未放行的全部件（含上轮换标后未放行、
+    # 因失效回流的件）。已报废件既不会恢复为仍隔离，也不能再次拆标/报废。
+    available_base = item["units"] - prior_scrapped - prior_released
+    open_units = available_base - cur.get("removed", 0)
+    cur_good = _epoch_good(cur)
+    # 待处置 = 本轮已拆 - 本轮当前合格 - 本轮报废
+    pending = cur.get("removed", 0) - cur_good - cur.get("scrapped", 0)
+    # 跨轮终态/合格累计
+    scrapped_total = prior_scrapped + cur.get("scrapped", 0)
+    cur_released = cur.get("released", 0)
+    released_total = prior_released + cur_released
+    # 当前持有效合格标结果：历史已放行（终态）+ 本轮合格件
+    good_current = prior_released + cur_good
+    still_quarantined = item["units"] - scrapped_total - good_current
+    # 待放行只认本轮合格件：历史未放行件已回流，须重新拆标重贴后才能放行
+    unreleased = cur_good - cur_released
+
+    if open_units == 0 and pending == 0 and unreleased == 0 \
             and still_quarantined >= 0:
-        if good_relabelled > 0:
+        if good_current > 0:
             status = "released"
-        elif agg["scrapped"] > 0:
+        elif scrapped_total > 0:
             status = "scrapped"
         else:
             status = "closed"
-    elif agg["released"] > 0:
+    elif released_total > 0 and (unreleased > 0 or still_quarantined > 0):
         status = "partially_released"
-    elif good_relabelled > 0:
+    elif cur_good > 0:
         status = "relabelled"
-    elif agg["removed"] > 0:
+    elif cur.get("removed", 0) > 0:
         status = "removed"
     else:
         status = "quarantined"
@@ -261,29 +320,42 @@ def item_state(store, disposition: dict, item: dict) -> dict:
         "units": item["units"],
         "isolated": item["isolated"],
         "status": status,
-        "removed_units": agg["removed"],
-        "relabelled_units": agg["relabelled"],
-        "inspection_failed_units": agg["inspection_failed"],
-        "good_relabelled_units": good_relabelled,
-        "scrapped_units": agg["scrapped"],
-        "released_units": agg["released"],
-        "unremoved_units": open_units,
-        "pending_units": pending,
+        "removed_units": cur.get("removed", 0),
+        "relabelled_units": cur.get("relabelled", 0),
+        "inspection_failed_units": cur.get("inspection_failed", 0),
+        "good_relabelled_units": cur_good,
+        "scrapped_units": cur.get("scrapped", 0),
+        "released_units": cur_released,
+        # 跨轮继承的不可逆实物结果
+        "prior_scrapped_units": prior_scrapped,
+        "prior_released_units": prior_released,
+        "prior_removed_units": prior_removed,
+        "total_scrapped_units": scrapped_total,
+        "total_released_units": released_total,
+        "total_good_relabelled_units": good_current,
+        "available_base_units": available_base,
+        "unremoved_units": max(0, open_units),
+        "pending_units": max(0, pending),
         "still_quarantined_units": still_quarantined,
         "unreleased_units": unreleased,
-        "labels_consumed": labels_consumed,
+        "labels_consumed": cur.get("labels_consumed", 0),
     }
 
 
 def reconciliation(store, disposition: dict) -> dict:
-    """实时核平：件数等式 + 新卷标预留/消耗等式，按当前 epoch 事件账计算。"""
+    """实时核平：件数等式 + 新卷标预留/消耗等式。
+
+    件数等式跨审核轮次累计（报废/合格为不可逆实物结果）；卷标等式按当前
+    epoch 的预留账独立核平（上一轮预留已在失效/结案时退回）。
+    """
     states = [item_state(store, disposition, it)
               for it in store.relabel_items(disposition["disposition_id"])]
     isolated_units = sum(s["units"] for s in states)
+    # 当前轮的重贴尝试件数（含抽检失败返工）；累计合格含历史轮不可逆结果
     relabelled = sum(s["relabelled_units"] for s in states)
-    good_relabelled = sum(s["good_relabelled_units"] for s in states)
-    scrapped = sum(s["scrapped_units"] for s in states)
-    released = sum(s["released_units"] for s in states)
+    good_relabelled = sum(s["total_good_relabelled_units"] for s in states)
+    scrapped = sum(s["total_scrapped_units"] for s in states)
+    released = sum(s["total_released_units"] for s in states)
     failed = sum(s["inspection_failed_units"] for s in states)
     still_quarantined = sum(s["still_quarantined_units"] for s in states)
     removed = sum(s["removed_units"] for s in states)
@@ -479,8 +551,12 @@ def review_evaluation(store, disposition: dict) -> dict:
             "fingerprint": f.fingerprint, "message": f.message,
             "detail": f.detail})
 
-    required_labels = sum(i["units"] for i in items if i["isolated"]) \
-        * disposition["labels_per_unit"]
+    # 预留量只覆盖本轮仍可处置实物池：扣除此前各轮已报废/已放行的不可逆
+    # 终态件（它们既不恢复为仍隔离，也不再需要新卷标）
+    terminal_units = _prior_terminal_units(store, disposition)
+    processable = sum(i["units"] for i in items if i["isolated"]) \
+        - terminal_units
+    required_labels = processable * disposition["labels_per_unit"]
     if pb is not None:
         reference_date = utcnow()[:10]
         for f in _print_batch_gate(store, pb, batch, reference_date):
@@ -565,7 +641,8 @@ def submit_review(store, disposition_id: str, reviewer: str) -> dict:
     """审核（串行事务）：门禁不过不落任何记录；通过则抬升 epoch 并预留新卷标。
 
     草拟与失效待复核的处置单都可送审；每次通过开启新一轮（epoch+1），
-    重审预留只按当前隔离件数计算（旧轮预留已在失效时退回）。
+    重审预留只按当前仍可处置实物件数计算（扣除此前各轮已报废/已放行的
+    不可逆终态件；旧轮预留已在失效时退回）。
     """
     with store.transaction():
         d = store.get_relabel_disposition(disposition_id)
@@ -584,6 +661,8 @@ def submit_review(store, disposition_id: str, reviewer: str) -> dict:
                    "quantity": result["required_labels"],
                    "reason": f"处置单 {disposition_id} 第 {epoch} 轮审核通过预留"}]
         review = {
+            "new_label_id": d["new_label_id"],
+            "new_print_batch_id": d["new_print_batch_id"],
             "analysis_version": result["analysis_version"],
             "approved_copy": result["approved_copy"],
             "print_summary": result["print_summary"],
@@ -927,6 +1006,36 @@ def build_audit_export(store, disposition_id: str) -> dict:
         for iss in run["issuances"]:
             if iss["label_id"] not in old_label_ids:
                 old_label_ids.append(iss["label_id"])
+    reviews_enriched = []
+    for rv in reviews:
+        lbl = store.get_label(rv["new_label_id"]) if rv.get("new_label_id") else None
+        pbv = store.get_print_batch(rv["new_print_batch_id"]) \
+            if rv.get("new_print_batch_id") else None
+        reviews_enriched.append({
+            **rv,
+            # 直接还原该轮候选标签修订（无需再查处置单当前指向）
+            "candidate_label": (
+                {"label_id": lbl["id"], "revision": lbl["revision"],
+                 "product_id": lbl["product_id"], "status": lbl["status"],
+                 "stale": lbl["stale"], "copy": lbl["copy"]}
+                if lbl else None),
+            "candidate_print_batch": (
+                {"print_batch_id": pbv["print_batch_id"],
+                 "label_id": pbv["label_id"],
+                 "copy_summary": pbv["copy_summary"],
+                 "status": pbv["status"]}
+                if pbv else None),
+        })
+    ledger = store.relabel_label_ledger(disposition_id)
+    # label_ledger 保留全部明细（跨 PB2/PB3、跨轮），并给出按印刷批次+轮次
+    # 的分轮汇总，便于直接核对每轮预留/消耗/退回
+    ledger_by_epoch: dict[tuple, dict] = {}
+    for e in ledger:
+        key = (e["print_batch_id"], e["epoch"])
+        grp = ledger_by_epoch.setdefault(key, {
+            "print_batch_id": e["print_batch_id"], "epoch": e["epoch"],
+            "reserved": 0, "consumed": 0, "returned": 0})
+        grp[e["kind"]] = grp.get(e["kind"], 0) + e["quantity"]
     return {
         "export_type": "relabel_disposition_audit",
         "generated_at": utcnow(),
@@ -951,14 +1060,23 @@ def build_audit_export(store, disposition_id: str) -> dict:
              "frozen_reason": new_pb["frozen_reason"]} if new_pb else None),
         "revision_chain": {
             "new_label_chain": revision_chain(store, d["new_label_id"]),
+            "candidate_chains_by_epoch": [
+                {"epoch": rv["epoch"],
+                 "new_label_id": rv.get("new_label_id"),
+                 "chain": revision_chain(store, rv["new_label_id"])
+                 if rv.get("new_label_id") else []}
+                for rv in reviews],
             "old_label_chains": [revision_chain(store, lid)
                                  for lid in old_label_ids],
         },
-        "reviews": reviews,
+        "reviews": reviews_enriched,
         "closures": closures,
         "events": events,
         "run_locks": store.run_locks_for_disposition(disposition_id),
-        "label_ledger": store.relabel_label_ledger(disposition_id),
+        "label_ledger": ledger,
+        "label_ledger_by_epoch": sorted(
+            ledger_by_epoch.values(),
+            key=lambda g: (g["epoch"], g["print_batch_id"])),
     }
 
 
