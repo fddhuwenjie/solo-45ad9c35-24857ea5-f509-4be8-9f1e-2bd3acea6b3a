@@ -192,8 +192,17 @@ def freeze_for_label(store, label_id: str, reason: str) -> dict:
     已全部领用（余量为 0）的批次无需冻结，但其领用记录仍出现在处置清单里——
     已经贴到产品上的旧文案必须进入处置评估。包装执行波及一并列出：未结算
     现场余量（领出未上线 + 未结算运行的线边余量）、已包装数量与待隔离批次。
+
+    以这些印刷批次作为**新卷标候选**的在办换标处置单同步失效（卷标已冻结，
+    审核快照基础不再成立），列出待复核标识；未消耗预留退回可领用余量。
     """
+    from . import relabeling  # 延迟导入避免循环依赖
+
     frozen = store.freeze_available_print_batches_for_label(label_id, reason)
+    invalidated = []
+    for pb in frozen:
+        invalidated.extend(relabeling.invalidate_for_print_batch(
+            store, pb["print_batch_id"], reason))
     affected_batches: dict[str, dict] = {}
     for pb in store.print_batches_for_label(label_id):
         for iss in store.issuances_for_print_batch(pb["print_batch_id"]):
@@ -227,4 +236,5 @@ def freeze_for_label(store, label_id: str, reason: str) -> dict:
                                       key=lambda b: b["production_batch_id"]),
         "pending_isolation_batches":
             packaging_disposition["pending_isolation_batches"],
+        "relabel_invalidated": invalidated,
     }

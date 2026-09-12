@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
-from . import __version__, engine, genealogy, packaging, printing, report, trace
+from . import __version__, engine, genealogy, packaging, printing, relabeling, report, trace
 from .db import Store, utcnow
 from .models import (
     AllocationCreate,
@@ -33,6 +33,11 @@ from .models import (
     PrintBatchIssue,
     ProductCreate,
     RecipeCreate,
+    RelabelAmendRequest,
+    RelabelCloseRequest,
+    RelabelDispositionCreate,
+    RelabelEventCreate,
+    RelabelReviewRequest,
     ReworkPathCreate,
     SwabBackfill,
     SwabResultCreate,
@@ -113,6 +118,18 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         )
         impact = genealogy.correction_impact(store, ingredient_id, body.version,
                                              corrects_version=body.corrects_version)
+        # 供应商规格更正：在办换标处置按新规则复核（受影响批次处置单失效待复核）
+        if impact.get("correction"):
+            batches = impact["correction"].get("affected_batches") or []
+            frozen_invalidated = []
+            for a in impact.get("actions", []):
+                frozen_invalidated.extend(
+                    (a.get("print_freeze") or {}).get("relabel_invalidated", []))
+            invalidated = relabeling.dedup_invalidated(
+                frozen_invalidated + relabeling.invalidate_for_batch(
+                    store, batches,
+                    reason=f"供应商规格更正 {ingredient_id}@{body.version} 再变动"))
+            impact["relabel_invalidated"] = invalidated
         return {"version": ver, **impact}
 
     @app.post("/products", status_code=201, tags=["资料登记"])
@@ -130,7 +147,12 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             raise HTTPException(409, f"配方版本 {body.version} 已存在")
         recipe = store.add_recipe(product_id, body.version, [i.model_dump() for i in body.items])
         actions = engine.apply_impact(store, [product_id], reason=f"新配方版本 {product_id}@{body.version}")
-        return {"recipe": recipe, "actions": actions}
+        batch_ids = [b["batch_id"] for b in store.batches_for_product(product_id)]
+        invalidated = relabeling.invalidate_for_batch(
+            store, batch_ids,
+            reason=f"产品 {product_id} 新配方版本 {body.version}，规则再变动")
+        return {"recipe": recipe, "actions": actions,
+                "relabel_invalidated": invalidated}
 
     @app.post("/lines", status_code=201, tags=["资料登记"])
     def create_line(body: LineCreate, store: Store = Depends(get_store)):
@@ -147,7 +169,12 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             raise HTTPException(404, f"产线 {line_id} 不存在")
         store.assign_line(product_id, line_id)
         actions = engine.apply_impact(store, [product_id], reason=f"共线变更 {product_id} -> {line_id}")
-        return {"product_id": product_id, "line_id": line_id, "actions": actions}
+        batch_ids = [b["batch_id"] for b in store.batches_for_product(product_id)]
+        invalidated = relabeling.invalidate_for_batch(
+            store, batch_ids,
+            reason=f"产品 {product_id} 共线变更（{line_id}），规则再变动")
+        return {"product_id": product_id, "line_id": line_id, "actions": actions,
+                "relabel_invalidated": invalidated}
 
     # ------------------------------------------------------------- 批次与逐批追溯
     def _batch_or_404(batch_id: str, store: Store) -> dict:
@@ -184,8 +211,19 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                     {"run_id": r["run_id"], "line_id": r["line_id"],
                      "status": r["status"], "planned_quantity": r["planned_quantity"],
                      "labels_per_unit": r["labels_per_unit"],
-                     "issued_quantity": sum(i["quantity"] for i in r["issuances"])}
-                    for r in store.runs_for_batch(batch_id)]}
+                     "issued_quantity": sum(i["quantity"] for i in r["issuances"]),
+                     **({"relabel_lock": store.run_relabel_lock(r["run_id"])}
+                        if store.run_relabel_lock(r["run_id"]) else {})}
+                    for r in store.runs_for_batch(batch_id)],
+                "relabel_dispositions": [
+                    {"disposition_id": d["disposition_id"], "status": d["status"],
+                     "source_kind": d["source_kind"],
+                     "new_label_id": d["new_label_id"],
+                     "new_print_batch_id": d["new_print_batch_id"],
+                     "current_epoch": d["current_epoch"],
+                     "invalidated_reason": d["invalidated_reason"],
+                     "created_at": d["created_at"], "approved_at": d["approved_at"]}
+                    for d in store.relabel_dispositions_for_batch(batch_id)]}
 
     @app.get("/batches/{batch_id}/trace", tags=["批次追溯"])
     def batch_trace(batch_id: str, store: Store = Depends(get_store)):
@@ -263,8 +301,21 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             reason=(f"拭子 {swab_id} 补录{'阳性' if exceeded else '阴性'}结果 "
                     f"{body.value_ppm} ppm"
                     + (f"（限值 {program['limit_ppm']} ppm）" if program else "")))
+        invalidated = []
+        if exceeded:
+            # 阳性传播：受影响批次的在办换标处置须按新证据复核重审。
+            # freeze_for_label 已从印刷批次维度失效部分处置单，按处置单去重合并
+            frozen_invalidated = []
+            for a in actions:
+                fr = a.get("print_freeze") or {}
+                frozen_invalidated.extend(fr.get("relabel_invalidated", []))
+            invalidated = relabeling.dedup_invalidated(
+                frozen_invalidated + relabeling.invalidate_for_batch(
+                    store, sorted(impacted),
+                    reason=f"拭子 {swab_id} 补录阳性结果，批次追溯开放路径变化"))
         return {"swab": updated, "exceeded_limit": exceeded,
-                "impacted_batches": sorted(impacted), "actions": actions}
+                "impacted_batches": sorted(impacted), "actions": actions,
+                "relabel_invalidated": invalidated}
 
     @app.post("/rework-paths", status_code=201, tags=["批次追溯"])
     def add_rework_path(body: ReworkPathCreate, store: Store = Depends(get_store)):
@@ -424,10 +475,24 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         store.set_label_status(label_id, "withdrawn")
         reason = f"标签撤回：{body.reason}"
         print_freeze = printing.freeze_for_label(store, label_id, reason=reason)
+        # 在办处置失效：候选新标签正是被撤回修订的处置单；以及本次撤回新圈入的
+        # 受影响批次上已在办的处置单（规则再变动须复核重审）。freeze_for_label
+        # 已从印刷批次维度失效了部分处置单，这里按处置单 ID 去重合并
+        invalidated = relabeling.invalidate_for_label(
+            store, label_id, reason=reason)
+        freeze_batches = sorted(set(print_freeze["pending_isolation_batches"]) | {
+            b["production_batch_id"]
+            for b in print_freeze["disposition_batches"]})
+        invalidated += relabeling.invalidate_for_batch(
+            store, freeze_batches, reason=reason)
+        invalidated = relabeling.dedup_invalidated(
+            print_freeze.get("relabel_invalidated", []) + invalidated)
         store.log_event("label_withdrawn", {"label_id": label_id, "reason": body.reason,
-                                            "print_freeze": print_freeze})
+                                            "print_freeze": print_freeze,
+                                            "relabel_invalidated": invalidated})
         view = _label_view(store, store.get_label(label_id))
         view["print_freeze"] = print_freeze
+        view["relabel_invalidated"] = invalidated
         return view
 
     @app.post("/labels/{label_id}/reanalyze", tags=["分析"])
@@ -745,6 +810,16 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             raise HTTPException(404, f"包装运行 {run_id} 不存在")
         return run
 
+    def _ensure_run_unlocked(run_id: str, store: Store) -> None:
+        """原包装运行被换标处置单锁定后，用标事件/调整/结算一律拒绝（锁只增）。"""
+        lock = store.run_relabel_lock(run_id)
+        if lock is not None:
+            raise HTTPException(
+                409, {"error": f"原包装运行 {run_id} 已被换标处置单 "
+                               f"{lock['disposition_id']} 锁定，不得再改动原包装账",
+                      "disposition_id": lock["disposition_id"],
+                      "locked_at": lock["created_at"]})
+
     @app.post("/packaging-runs", status_code=201, tags=["包装执行"])
     def start_packaging_run(body: PackagingRunCreate, store: Store = Depends(get_store)):
         """开工登记：绑定生产批次、领用记录、包装线、计划产量与每件用标数，
@@ -760,6 +835,12 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             raise HTTPException(404, f"生产批次 {body.production_batch_id} 不存在")
         if store.get_line(body.line_id) is None:
             raise HTTPException(404, f"包装线 {body.line_id} 不存在")
+        # 仅拦截被处置单锁定的原包装运行（同批次用新卷标的新包装流程不受影响）；
+        # 已绑定运行的领用由开工门禁 issuance_already_bound 拒绝
+        for iss_id in body.issuance_ids:
+            bound = store.issuance_bound_run(iss_id)
+            if bound is not None:
+                _ensure_run_unlocked(bound, store)
         outcome = packaging.start_run(
             store, body.run_id, batch, body.line_id, body.planned_quantity,
             body.labels_per_unit, body.issuance_ids, body.operator,
@@ -794,6 +875,7 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         账上，不补回印刷批次可领用余量。
         """
         run = _run_or_404(run_id, store)
+        _ensure_run_unlocked(run_id, store)
         if run["status"] != "open":
             raise HTTPException(
                 409, {"error": f"包装运行已结算（状态 {run['status']}），"
@@ -846,6 +928,7 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         结算快照保持不可覆盖。
         """
         run = _run_or_404(run_id, store)
+        _ensure_run_unlocked(run_id, store)
         if body.delta == 0 and body.good_units_delta == 0:
             raise HTTPException(422, "delta 与 good_units_delta 不得同时为 0")
         if body.category != "applied" and body.good_units_delta != 0:
@@ -891,6 +974,7 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         盘点更正追加调整事件后重新结算，生成新的结算记录，历史记录不可覆盖。
         """
         _run_or_404(run_id, store)
+        _ensure_run_unlocked(run_id, store)
         outcome = packaging.settle(store, run_id, body.settled_by)
         if outcome["outcome"] == "discrepancy":
             raise HTTPException(
@@ -899,6 +983,210 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
         return {"settlement": outcome["settlement"],
                 "reconciliation": outcome["reconciliation"],
                 "run": packaging.run_view(store, run_id)}
+
+    # ------------------------------------------------------------- 成品换标处置
+    def _relabel_or_404(disposition_id: str, store: Store) -> dict:
+        d = store.get_relabel_disposition(disposition_id)
+        if d is None:
+            raise HTTPException(404, f"换标处置单 {disposition_id} 不存在")
+        return d
+
+    def _ensure_relabel_writable(d: dict) -> None:
+        """已结案记录只读：任何写操作（事件/改指定/重审/再结案）一律拒绝。"""
+        if d["status"] == "closed":
+            raise HTTPException(
+                409, {"error": f"处置单 {d['disposition_id']} 已结案，记录只读",
+                      "status": d["status"]})
+
+    @app.post("/relabel-dispositions", status_code=201, tags=["成品换标处置"])
+    def create_relabel_disposition(body: RelabelDispositionCreate,
+                                   store: Store = Depends(get_store)):
+        """登记成品换标处置单（草拟）：
+
+        处置单只能引用撤回 / 规格更正 / 阳性拭子传播圈出的受影响批次；
+        逐项登记外箱/托盘标识与件数，创建即锁定该批次原包装运行（锁只增），
+        并指定候选新标签修订与新卷标印刷批次。未隔离、标识占用等在审核时
+        逐项复核；同单重复标识 / 其他在办处置占用在创建时即拒绝。
+        """
+        if store.get_relabel_disposition(body.disposition_id):
+            raise HTTPException(409, f"处置单 {body.disposition_id} 已存在")
+        batch = store.get_batch(body.affected_batch_id)
+        if batch is None:
+            raise HTTPException(404, f"生产批次 {body.affected_batch_id} 不存在")
+        source = relabeling.affected_source(store, body.affected_batch_id)
+        if source is None:
+            raise HTTPException(
+                409, {"error": "批次不在撤回/规格更正/阳性传播的受影响清单内，"
+                               "凭手工输入不得开立换标处置单",
+                      "failures": [{"code": "batch_not_affected",
+                                    "batch_id": body.affected_batch_id}]})
+        outcome = relabeling.create_disposition(
+            store, body.disposition_id, batch, source,
+            body.new_label_id, body.new_print_batch_id, body.labels_per_unit,
+            [i.model_dump() for i in body.items], body.created_by)
+        if outcome["outcome"] == "conflict":
+            raise HTTPException(409, f"处置单 {body.disposition_id} 已存在")
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "处置单创建门禁未通过，未登记任何记录",
+                      "failures": outcome["failures"]})
+        return relabeling.disposition_view(store, body.disposition_id)
+
+    @app.get("/relabel-dispositions", tags=["成品换标处置"])
+    def list_relabel_dispositions(status: str | None = None,
+                                  batch_id: str | None = None,
+                                  store: Store = Depends(get_store)):
+        """处置单清单：可按状态（draft/approved/closed/invalidated）或批次过滤。"""
+        statuses = [status] if status else None
+        if statuses:
+            from .db import RELABEL_STATUSES
+            if status not in RELABEL_STATUSES:
+                raise HTTPException(422, f"未知状态 {status}，支持 {RELABEL_STATUSES}")
+        out = []
+        for d in store.all_relabel_dispositions(statuses):
+            if batch_id and d["affected_batch_id"] != batch_id:
+                continue
+            rec = relabeling.reconciliation(store, d)
+            pending = [
+                {"item_id": s["item_id"], "identifier": s["identifier"],
+                 "identifier_kind": s["identifier_kind"], "status": s["status"]}
+                for s in rec["items"]]
+            out.append({
+                "disposition_id": d["disposition_id"],
+                "affected_batch_id": d["affected_batch_id"],
+                "source_kind": d["source_kind"],
+                "new_label_id": d["new_label_id"],
+                "new_print_batch_id": d["new_print_batch_id"],
+                "status": d["status"], "current_epoch": d["current_epoch"],
+                "invalidated_reason": d["invalidated_reason"],
+                "pending_review_items": pending if d["status"] == "invalidated" else [],
+                "created_at": d["created_at"], "approved_at": d["approved_at"]})
+        return {"dispositions": out}
+
+    @app.get("/relabel-dispositions/{disposition_id}", tags=["成品换标处置"])
+    def get_relabel_disposition(disposition_id: str,
+                                store: Store = Depends(get_store)):
+        """处置单完整视图：标识、处置事件、各轮审核、结案快照、运行锁与实时核平。"""
+        _relabel_or_404(disposition_id, store)
+        return relabeling.disposition_view(store, disposition_id)
+
+    @app.post("/relabel-dispositions/{disposition_id}/review", tags=["成品换标处置"])
+    def review_relabel_disposition(disposition_id: str, body: RelabelReviewRequest,
+                                   store: Store = Depends(get_store)):
+        """审核处置单：重算该批次过敏原声明，逐项比对新标签批准快照与印刷文案。
+
+        未隔离、标识被其他处置占用、声明不符、存在新增开放 blocker、卷标
+        冻结/失效或余量不足均不得开工。通过后抬升审核轮次（epoch）并按
+        隔离件数预留新卷标；草拟与失效待复核的处置单均可送审。
+        """
+        d = _relabel_or_404(disposition_id, store)
+        _ensure_relabel_writable(d)
+        outcome = relabeling.submit_review(store, disposition_id, body.reviewer)
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "审核门禁未通过，不得开工",
+                      "failures": outcome["failures"],
+                      "item_checks": outcome.get("item_checks"),
+                      "analysis_version": outcome.get("analysis_version")})
+        if outcome["outcome"] == "wrong_status":
+            raise HTTPException(
+                409, f"处置单状态 {outcome['status']}，仅草拟/失效待复核可送审")
+        return relabeling.disposition_view(store, disposition_id)
+
+    @app.put("/relabel-dispositions/{disposition_id}/candidate",
+             tags=["成品换标处置"])
+    def amend_relabel_candidate(disposition_id: str, body: RelabelAmendRequest,
+                                store: Store = Depends(get_store)):
+        """在办失效/草拟处置单改指定候选新标签修订与新卷标印刷批次（改后须重审）。"""
+        d = _relabel_or_404(disposition_id, store)
+        _ensure_relabel_writable(d)
+        if d["status"] not in ("draft", "invalidated"):
+            raise HTTPException(
+                409, f"处置单状态 {d['status']}，仅草拟/失效待复核可改指定")
+        outcome = relabeling.amend_candidate(
+            store, disposition_id, body.new_label_id, body.new_print_batch_id)
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "改指定未通过门禁",
+                      "failures": outcome["failures"]})
+        return relabeling.disposition_view(store, disposition_id)
+
+    @app.post("/relabel-dispositions/{disposition_id}/events",
+              tags=["成品换标处置"])
+    def record_relabel_event(disposition_id: str, body: RelabelEventCreate,
+                             response: Response, store: Store = Depends(get_store)):
+        """追加处置事件（幂等）：拆标 / 重贴 / 报废 / 抽检失败 / 放行。
+
+        幂等键唯一：同键同内容重放复用原事件（200），同键冲突 409。
+        事件只增不改；处置单失效后旧轮事件账冻结，复核重审后按新轮登记。
+        """
+        d = _relabel_or_404(disposition_id, store)
+        outcome = relabeling.record_event(
+            store, disposition_id, body.item_id, body.idempotency_key,
+            body.kind, body.quantity, body.operator, body.occurred_at,
+            body.reason)
+        if outcome["outcome"] == "not_found":
+            raise HTTPException(404, f"处置单 {disposition_id} 不存在")
+        if outcome["outcome"] == "conflict":
+            prior = outcome["prior"]
+            raise HTTPException(
+                409, {"error": "幂等键重复但事件内容不一致，已记录事件不可改写",
+                      "idempotency_key": body.idempotency_key,
+                      "original": {"disposition_id": prior["disposition_id"],
+                                   "item_id": prior["item_id"],
+                                   "kind": prior["kind"],
+                                   "quantity": prior["quantity"],
+                                   "labels_used": prior["labels_used"],
+                                   "epoch": prior["epoch"],
+                                   "operator": prior["operator"]},
+                      "conflicting": {"disposition_id": disposition_id,
+                                      "item_id": body.item_id, "kind": body.kind,
+                                      "quantity": body.quantity,
+                                      "operator": body.operator}})
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "处置事件未通过门禁，未记录",
+                      "failures": outcome["failures"]})
+        if outcome["outcome"] == "reused":
+            response.status_code = 200
+            return {"event": outcome["event"], "reused": True}
+        response.status_code = 201
+        return {"event": outcome["event"], "reused": False,
+                "reconciliation": relabeling.reconciliation(store, d)}
+
+    @app.post("/relabel-dispositions/{disposition_id}/close",
+              tags=["成品换标处置"])
+    def close_relabel_disposition(disposition_id: str, body: RelabelCloseRequest,
+                                  store: Store = Depends(get_store)):
+        """结案：同时核平件数等式与新卷标消耗等式才落结案记录（append-only）。
+
+          隔离件数 = 换标合格 + 报废 + 仍隔离
+          预留卷标 = 重贴消耗 + 结案退回
+          换标合格件须全部放行
+
+        不平衡或仍有合格件未放行时 409 并返回逐项数量来源；结案后记录只读。
+        """
+        _relabel_or_404(disposition_id, store)
+        outcome = relabeling.close_disposition(store, disposition_id, body.closed_by)
+        if outcome["outcome"] == "not_found":
+            raise HTTPException(404, f"处置单 {disposition_id} 不存在")
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "结案核平未通过",
+                      "failures": outcome["failures"],
+                      **({"reconciliation": outcome["reconciliation"]}
+                         if "reconciliation" in outcome else {})})
+        return {"closure": outcome["closure"],
+                "reconciliation": outcome["reconciliation"],
+                "disposition": relabeling.disposition_view(store, disposition_id)}
+
+    @app.get("/relabel-dispositions/{disposition_id}/audit-export",
+             tags=["成品换标处置"])
+    def relabel_audit_export(disposition_id: str,
+                             store: Store = Depends(get_store)):
+        """审计导出：串起原包装、换标去向与修订链（含各轮审核/结案快照）。"""
+        _relabel_or_404(disposition_id, store)
+        return relabeling.build_audit_export(store, disposition_id)
 
     # ------------------------------------------------------------- 报告
     @app.get("/labels/{label_id}/check-package", tags=["报告"])

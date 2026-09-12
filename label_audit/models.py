@@ -347,3 +347,67 @@ class PackagingSettle(BaseModel):
     """卷标结算：两条平衡等式同时满足才落结算记录。"""
 
     settled_by: str = Field(min_length=1, description="结算人")
+
+
+# ------------------------------------------------------------- 成品换标处置
+class RelabelItemCreate(BaseModel):
+    """逐项登记的箱/托盘标识与隔离件数。"""
+
+    identifier: str = Field(min_length=1, description="外箱号或托盘号（全局唯一追踪）")
+    identifier_kind: Literal["case", "pallet"] = Field(
+        description="标识类型：case 外箱 / pallet 托盘")
+    units: int = Field(gt=0, description="该标识下的成品件数")
+    isolated: bool = Field(default=True, description="是否已隔离；未隔离审核不得开工")
+
+
+class RelabelDispositionCreate(BaseModel):
+    """成品换标处置单：引用受影响批次，锁定原包装运行，指定候选新标签/新卷标。"""
+
+    disposition_id: str = Field(min_length=1)
+    affected_batch_id: str = Field(min_length=1,
+                                   description="撤回/规格更正/阳性传播圈出的受影响批次")
+    new_label_id: str = Field(min_length=1, description="候选新标签修订（须已批准）")
+    new_print_batch_id: str = Field(min_length=1, description="候选新卷标印刷批次")
+    labels_per_unit: int = Field(default=1, ge=1, description="每件重贴用标数")
+    items: list[RelabelItemCreate] = Field(min_length=1,
+                                           description="逐项登记的外箱/托盘标识")
+    created_by: str = Field(min_length=1)
+
+
+class RelabelReviewRequest(BaseModel):
+    """审核处置单：重算过敏原声明并逐项比对批准快照/印刷文案。"""
+
+    reviewer: str = Field(min_length=1)
+
+
+class RelabelEventCreate(BaseModel):
+    """处置事件（幂等追加）：拆标/重贴/报废/抽检失败/放行。
+
+    removed 拆标、relabelled 重贴合格、scrapped 报废、inspection_failed
+    抽检失败（回到隔离待返工）、released 放行；数量均为成品件数，
+    重贴用标数由 件数 × 每件用标数 自动计入新卷标账。
+    """
+
+    item_id: str = Field(min_length=1, description="处置单内标识项 ID")
+    kind: Literal["removed", "relabelled", "scrapped", "inspection_failed",
+                  "released"]
+    quantity: int = Field(gt=0, description="本事件件数")
+    operator: str = Field(min_length=1)
+    occurred_at: Optional[str] = Field(default=None,
+                                       description="发生时刻 ISO8601；缺省取服务器当前时刻")
+    reason: Optional[str] = Field(default=None, description="事由（如报废原因）")
+    idempotency_key: str = Field(min_length=1,
+                                 description="幂等键；同键同内容重放复用原事件")
+
+
+class RelabelCloseRequest(BaseModel):
+    """结案：件数等式与新卷标等式同时核平方可落结案记录。"""
+
+    closed_by: str = Field(min_length=1)
+
+
+class RelabelAmendRequest(BaseModel):
+    """在办失效/草拟处置单改指定候选新标签修订与新卷标印刷批次（改后重审）。"""
+
+    new_label_id: str = Field(min_length=1)
+    new_print_batch_id: str = Field(min_length=1)

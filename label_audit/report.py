@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 
-from . import genealogy, packaging, trace
+from . import genealogy, packaging, relabeling, trace
 from .db import utcnow
 from .engine import analyze_label, expand_recipe
 
@@ -129,6 +129,8 @@ def build_check_package(store, label_id: str) -> dict:
             "runs": packaging_runs,
             "disposition": packaging.disposition_for_label(store, label_id),
         },
+        "relabel_disposition": relabeling.label_disposition_evidence(
+            store, label_id),
         "evidence_index": evidence_index,
     }
 
@@ -326,6 +328,55 @@ def build_review_sheet(store, label_id: str) -> str:
                    if settlements else ""))
         return out
 
+    def relabel_section() -> str:
+        ev = relabeling.label_disposition_evidence(store, label_id)
+        as_new = ev["as_new_label"]
+        as_old = ev["as_old_label"]
+        if not as_new and not as_old:
+            return "<table><tr><td class='empty'>（无换标处置记录）</td></tr></table>"
+        status_names = {"draft": "草拟", "approved": "在办（已审核）",
+                        "closed": "已结案", "invalidated": "失效待复核"}
+        out = ""
+
+        def rows(entries, role):
+            body = ""
+            for d in entries:
+                rec = d["reconciliation"]
+                ub, lb = rec["unit_balance"], rec["label_balance"]
+                inv = f"；失效原因：{_esc(d['invalidated_reason'])}" if d["invalidated_reason"] else ""
+                items = store.relabel_items(d["disposition_id"])
+                idents = ", ".join(
+                    f"{i['identifier']}×{i['units']}件" for i in items)
+                body += (
+                    f"<tr><td>{_esc(d['disposition_id'])}</td>"
+                    f"<td>{role}</td>"
+                    f"<td>{_esc(d['affected_batch_id'])}</td>"
+                    f"<td>{_esc(d['source_kind'])}</td>"
+                    f"<td>{_esc(status_names.get(d['status'], d['status']))}{inv}</td>"
+                    f"<td>{_esc(idents)}</td>"
+                    f"<td>隔离 {ub['isolated_units']} = 合格 "
+                    f"{ub['relabelled_units']} + 报废 {ub['scrapped_units']}"
+                    f" + 仍隔离 {ub['still_quarantined_units']}</td>"
+                    f"<td>预留 {lb['reserved_quantity']} / 消耗 "
+                    f"{lb['labels_consumed']} / 退回 {lb['returned_quantity']}</td></tr>")
+            return body or ""
+
+        out += ("<h3>以本修订为新标签的处置</h3>"
+                "<table><tr><th>处置单</th><th>角色</th><th>受影响批次</th>"
+                "<th>来源</th><th>状态</th><th>标识（件数）</th>"
+                "<th>件数核平</th><th>新卷标账</th></tr>"
+                + (rows(as_new, "新标签") or
+                   "<tr><td colspan='8' class='empty'>（无）</td></tr>")
+                + "</table>") if as_new else ""
+        out += ("<h3>原包装贴用过本修订的处置</h3>"
+                "<table><tr><th>处置单</th><th>角色</th><th>受影响批次</th>"
+                "<th>来源</th><th>状态</th><th>标识（件数）</th>"
+                "<th>件数核平</th><th>新卷标账</th></tr>"
+                + (rows(as_old, "旧标签") or
+                   "<tr><td colspan='8' class='empty'>（无）</td></tr>")
+                + "</table>") if as_old else ""
+        return out
+
     sheet = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>标签审查单 - {_esc(product['name'])} 第{label['revision']}版</title>
@@ -389,7 +440,10 @@ def build_review_sheet(store, label_id: str) -> str:
 <h2>九、包装执行与卷标结算（清场 / 用标 / 调整 / 结算）</h2>
 {packaging_section()}
 
-<h2>十、签字</h2>
+<h2>十、成品换标处置（原包装 / 换标去向 / 新卷标账）</h2>
+{relabel_section()}
+
+<h2>十一、签字</h2>
 <table class="sign"><tr><th>环节</th><th>签字</th><th>日期</th><th>备注</th></tr>
 {''.join(f"<tr><td>{s}</td><td></td><td></td><td></td></tr>" for s in ('草拟', '复核', '批准', '撤回'))}
 </table>

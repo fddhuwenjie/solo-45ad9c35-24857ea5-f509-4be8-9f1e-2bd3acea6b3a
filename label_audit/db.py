@@ -276,6 +276,89 @@ CREATE TABLE IF NOT EXISTS packaging_settlements (
     settled_by TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- 成品换标处置：处置单、箱/托盘标识、处置事件（幂等追加）、审核/结案快照、
+-- 原包装运行锁定与新卷标预留/消耗/退回账
+CREATE TABLE IF NOT EXISTS relabel_dispositions (
+    disposition_id TEXT PRIMARY KEY,
+    affected_batch_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_ref TEXT,
+    source_reason TEXT,
+    new_label_id TEXT NOT NULL,
+    new_print_batch_id TEXT NOT NULL,
+    labels_per_unit INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    current_epoch INTEGER NOT NULL DEFAULT 0,
+    invalidated_reason TEXT,
+    invalidated_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_by TEXT,
+    approved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS relabel_items (
+    item_id TEXT PRIMARY KEY,
+    disposition_id TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    identifier_kind TEXT NOT NULL,
+    units INTEGER NOT NULL,
+    isolated INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE (disposition_id, identifier)
+);
+CREATE TABLE IF NOT EXISTS relabel_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    disposition_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    labels_used INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL,
+    operator TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relabel_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    disposition_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    reviewer TEXT NOT NULL,
+    analysis_version TEXT NOT NULL,
+    approved_copy_snapshot TEXT NOT NULL,
+    print_copy_summary TEXT NOT NULL,
+    basis_derived TEXT NOT NULL,
+    item_checks TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relabel_closures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    closure_id TEXT NOT NULL UNIQUE,
+    disposition_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    snapshot TEXT NOT NULL,
+    closed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relabel_run_locks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    disposition_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (disposition_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS relabel_label_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    disposition_id TEXT NOT NULL,
+    print_batch_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    epoch INTEGER NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 # 标签生命周期：draft -> in_review -> approved -> withdrawn
@@ -296,6 +379,17 @@ PACKAGING_EVENT_KINDS = ("applied", "wasted", "sampled", "returned", "adjustment
 PACKAGING_CATEGORIES = ("applied", "wasted", "sampled", "returned")
 # 结算结果：balanced 平衡（不平衡时不落结算记录，仅返回差异与数量来源）
 SETTLEMENT_RESULTS = ("balanced",)
+# 换标处置单状态：draft 草拟 -> approved 审核通过可开工 -> closed 已结案（只读）/
+# invalidated 在办失效（规则/标签再变动，待复核重审）
+RELABEL_STATUSES = ("draft", "approved", "closed", "invalidated")
+# 标识类型：case 外箱 / pallet 托盘
+RELABEL_IDENTIFIER_KINDS = ("case", "pallet")
+# 处置事件：removed 拆标 / relabelled 重贴合格 / scrapped 报废 /
+# inspection_failed 抽检失败 / released 放行
+RELABEL_EVENT_KINDS = ("removed", "relabelled", "scrapped",
+                       "inspection_failed", "released")
+# 新卷标账：reserved 审核通过时预留 / consumed 重贴消耗 / returned 退回可领余量
+RELABEL_LEDGER_KINDS = ("reserved", "consumed", "returned")
 
 
 def utcnow() -> str:
@@ -1074,11 +1168,18 @@ class Store:
     def _decode_print_batch(self, r: sqlite3.Row) -> dict:
         issued = self.issued_quantity(r["print_batch_id"])
         disposed = self.disposed_quantity(r["print_batch_id"])
+        reserved = self.reserved_quantity(r["print_batch_id"])
+        consumed = self.reserved_consumed_quantity(r["print_batch_id"])
+        returned = self.reserved_returned_quantity(r["print_batch_id"])
         received = r["quantity_received"]
         status = r["status"]
-        remaining = received - issued - disposed
-        # 余量因领用归零而状态未及更新时，对外呈现为 closed（数据层兜底）
-        if remaining == 0 and status == "available":
+        # 可领用余量 = 入库 - 领用 - 处置 - 换标预留 + 预留退回；
+        # 已被重贴消耗的预留始终不回补（预留 = 消耗 + 退回 + 未用）
+        remaining = received - issued - disposed - reserved + returned
+        # 余量因领用/消耗归零而状态未及更新时，对外呈现为 closed（数据层兜底）。
+        # 仅被未消耗预留占满不算 closed：预留来自在办处置单，结案退回后仍可领用。
+        if received - issued - disposed - (reserved - returned) == 0 \
+                and status == "available":
             status = "closed"
         return {
             "print_batch_id": r["print_batch_id"],
@@ -1089,6 +1190,10 @@ class Store:
             "quantity_received": received,
             "issued_quantity": issued,
             "disposed_quantity": disposed,
+            "reserved_quantity": reserved,
+            "reserved_consumed_quantity": consumed,
+            "reserved_returned_quantity": returned,
+            "reserved_outstanding_quantity": reserved - consumed - returned,
             "remaining_quantity": remaining,
             "received_at": r["received_at"],
             "expires_at": r["expires_at"],
@@ -1479,5 +1584,411 @@ class Store:
             "result": r["result"],
             "snapshot": _loads(r["snapshot"], {}),
             "settled_by": r["settled_by"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 成品换标处置
+    def create_relabel_disposition(self, disposition_id: str, batch_id: str,
+                                   source_kind: str, source_ref: str | None,
+                                   source_reason: str | None, new_label_id: str,
+                                   new_print_batch_id: str, labels_per_unit: int,
+                                   items: list[dict], run_ids: list[str],
+                                   created_by: str) -> dict:
+        """登记处置单（草拟）：逐项登记箱/托盘标识，并锁定原包装运行。
+
+        原包装运行锁定是只增记录：即使处置单失效/结案也不解锁，保证处置期间
+        与处置完成后原包装账不可再被用标事件改动。
+        """
+        with self.transaction():
+            self._exec(
+                "INSERT INTO relabel_dispositions (disposition_id, affected_batch_id,"
+                " source_kind, source_ref, source_reason, new_label_id,"
+                " new_print_batch_id, labels_per_unit, status, current_epoch,"
+                " created_by, created_at) VALUES (?,?,?,?,?,?,?,?,'draft',0,?,?)",
+                (disposition_id, batch_id, source_kind, source_ref, source_reason,
+                 new_label_id, new_print_batch_id, labels_per_unit,
+                 created_by, utcnow()))
+            for it in items:
+                self._exec(
+                    "INSERT INTO relabel_items (item_id, disposition_id, identifier,"
+                    " identifier_kind, units, isolated, created_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (it["item_id"], disposition_id, it["identifier"],
+                     it["identifier_kind"], it["units"],
+                     int(it.get("isolated", True)), utcnow()))
+            for run_id in sorted(set(run_ids)):
+                self._exec(
+                    "INSERT OR IGNORE INTO relabel_run_locks (disposition_id, run_id,"
+                    " created_at) VALUES (?,?,?)",
+                    (disposition_id, run_id, utcnow()))
+            self.log_event("relabel_disposition_created", {
+                "disposition_id": disposition_id, "affected_batch_id": batch_id,
+                "source_kind": source_kind, "source_ref": source_ref,
+                "new_label_id": new_label_id,
+                "new_print_batch_id": new_print_batch_id,
+                "labels_per_unit": labels_per_unit,
+                "items": [{"item_id": i["item_id"], "identifier": i["identifier"],
+                           "identifier_kind": i["identifier_kind"],
+                           "units": i["units"],
+                           "isolated": bool(i.get("isolated", True))}
+                          for i in items],
+                "locked_run_ids": sorted(set(run_ids)),
+                "created_by": created_by})
+        return self.get_relabel_disposition(disposition_id)
+
+    def get_relabel_disposition(self, disposition_id: str) -> dict | None:
+        r = self._one(
+            "SELECT * FROM relabel_dispositions WHERE disposition_id = ?",
+            (disposition_id,))
+        return self._decode_relabel_disposition(r) if r else None
+
+    def all_relabel_dispositions(self, statuses: list[str] | None = None) -> list[dict]:
+        if statuses:
+            marks = ",".join("?" for _ in statuses)
+            rows = self._q(
+                f"SELECT * FROM relabel_dispositions WHERE status IN ({marks})"
+                f" ORDER BY rowid", tuple(statuses))
+        else:
+            rows = self._q("SELECT * FROM relabel_dispositions ORDER BY rowid")
+        return [self._decode_relabel_disposition(r) for r in rows]
+
+    def relabel_dispositions_for_batch(self, batch_id: str) -> list[dict]:
+        return [
+            self._decode_relabel_disposition(r)
+            for r in self._q(
+                "SELECT * FROM relabel_dispositions WHERE affected_batch_id = ?"
+                " ORDER BY rowid", (batch_id,))
+        ]
+
+    def relabel_dispositions_for_new_label(self, label_id: str) -> list[dict]:
+        return [
+            self._decode_relabel_disposition(r)
+            for r in self._q(
+                "SELECT * FROM relabel_dispositions WHERE new_label_id = ?"
+                " ORDER BY rowid", (label_id,))
+        ]
+
+    def relabel_dispositions_for_print_batch(self, print_batch_id: str) -> list[dict]:
+        return [
+            self._decode_relabel_disposition(r)
+            for r in self._q(
+                "SELECT * FROM relabel_dispositions WHERE new_print_batch_id = ?"
+                " ORDER BY rowid", (print_batch_id,))
+        ]
+
+    @staticmethod
+    def _decode_relabel_disposition(r: sqlite3.Row) -> dict:
+        return {
+            "disposition_id": r["disposition_id"],
+            "affected_batch_id": r["affected_batch_id"],
+            "source_kind": r["source_kind"],
+            "source_ref": r["source_ref"],
+            "source_reason": r["source_reason"],
+            "new_label_id": r["new_label_id"],
+            "new_print_batch_id": r["new_print_batch_id"],
+            "labels_per_unit": r["labels_per_unit"],
+            "status": r["status"],
+            "current_epoch": r["current_epoch"],
+            "invalidated_reason": r["invalidated_reason"],
+            "invalidated_at": r["invalidated_at"],
+            "created_by": r["created_by"],
+            "created_at": r["created_at"],
+            "approved_by": r["approved_by"],
+            "approved_at": r["approved_at"],
+        }
+
+    # --------------------------------------------------------------- 箱/托盘标识
+    def relabel_items(self, disposition_id: str) -> list[dict]:
+        return [
+            {"item_id": r["item_id"], "disposition_id": r["disposition_id"],
+             "identifier": r["identifier"], "identifier_kind": r["identifier_kind"],
+             "units": r["units"], "isolated": bool(r["isolated"]),
+             "created_at": r["created_at"]}
+            for r in self._q(
+                "SELECT * FROM relabel_items WHERE disposition_id = ? ORDER BY rowid",
+                (disposition_id,))
+        ]
+
+    def relabel_item(self, item_id: str) -> dict | None:
+        r = self._one("SELECT * FROM relabel_items WHERE item_id = ?", (item_id,))
+        if r is None:
+            return None
+        return {"item_id": r["item_id"], "disposition_id": r["disposition_id"],
+                "identifier": r["identifier"], "identifier_kind": r["identifier_kind"],
+                "units": r["units"], "isolated": bool(r["isolated"]),
+                "created_at": r["created_at"]}
+
+    def active_owner_of_identifier(self, identifier: str) -> dict | None:
+        """标识是否已被在办（未结案）处置单占用；已结案处置占用释放，可重新登记。"""
+        r = self._one(
+            "SELECT d.* FROM relabel_items i JOIN relabel_dispositions d"
+            " ON d.disposition_id = i.disposition_id WHERE i.identifier = ?"
+            " AND d.status != 'closed' ORDER BY d.rowid LIMIT 1",
+            (identifier,))
+        return self._decode_relabel_disposition(r) if r else None
+
+    def run_relabel_lock(self, run_id: str) -> dict | None:
+        """原包装运行是否已被任一处置单锁定（含已结案/已失效，锁只增不删）。"""
+        r = self._one(
+            "SELECT * FROM relabel_run_locks WHERE run_id = ? ORDER BY rowid LIMIT 1",
+            (run_id,))
+        if r is None:
+            return None
+        return {"run_id": run_id, "disposition_id": r["disposition_id"],
+                "created_at": r["created_at"]}
+
+    def run_locks_for_disposition(self, disposition_id: str) -> list[dict]:
+        return [
+            {"run_id": r["run_id"], "created_at": r["created_at"]}
+            for r in self._q(
+                "SELECT run_id, created_at FROM relabel_run_locks"
+                " WHERE disposition_id = ? ORDER BY rowid", (disposition_id,))
+        ]
+
+    # --------------------------------------------------------------- 处置事件（追加）
+    def create_relabel_event(self, event_id: str, disposition_id: str, item_id: str,
+                             idempotency_key: str, kind: str, quantity: int,
+                             labels_used: int, epoch: int, operator: str,
+                             occurred_at: str | None, reason: str | None) -> dict:
+        assert kind in RELABEL_EVENT_KINDS
+        occurred = occurred_at or utcnow()
+        with self.transaction():
+            self._exec(
+                "INSERT INTO relabel_events (event_id, disposition_id, item_id,"
+                " idempotency_key, kind, quantity, labels_used, epoch, operator,"
+                " occurred_at, reason, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, disposition_id, item_id, idempotency_key, kind,
+                 quantity, labels_used, epoch, operator, occurred, reason,
+                 utcnow()))
+            if labels_used:
+                self._exec(
+                    "INSERT INTO relabel_label_ledger (disposition_id, print_batch_id,"
+                    " kind, quantity, epoch, reason, created_at)"
+                    " SELECT ?, new_print_batch_id, 'consumed', ?, ?, ?, ?"
+                    " FROM relabel_dispositions WHERE disposition_id = ?",
+                    (disposition_id, labels_used, epoch, reason, utcnow(),
+                     disposition_id))
+            self.log_event("relabel_event_recorded", {
+                "event_id": event_id, "disposition_id": disposition_id,
+                "item_id": item_id, "kind": kind, "quantity": quantity,
+                "labels_used": labels_used, "epoch": epoch,
+                "operator": operator, "occurred_at": occurred, "reason": reason,
+                "idempotency_key": idempotency_key})
+        return self.get_relabel_event(event_id)
+
+    def get_relabel_event(self, event_id: str) -> dict | None:
+        r = self._one("SELECT * FROM relabel_events WHERE event_id = ?", (event_id,))
+        return self._decode_relabel_event(r) if r else None
+
+    def relabel_event_by_key(self, idempotency_key: str) -> dict | None:
+        r = self._one("SELECT * FROM relabel_events WHERE idempotency_key = ?",
+                      (idempotency_key,))
+        return self._decode_relabel_event(r) if r else None
+
+    def relabel_events(self, disposition_id: str, current_epoch: bool = False,
+                       epoch: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM relabel_events WHERE disposition_id = ?"
+        params: list = [disposition_id]
+        if current_epoch:
+            sql += " AND epoch = (SELECT current_epoch FROM relabel_dispositions" \
+                   " WHERE disposition_id = ?)"
+            params.append(disposition_id)
+        elif epoch is not None:
+            sql += " AND epoch = ?"
+            params.append(epoch)
+        return [self._decode_relabel_event(r)
+                for r in self._q(sql + " ORDER BY id", tuple(params))]
+
+    @staticmethod
+    def _decode_relabel_event(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "event_id": r["event_id"],
+            "disposition_id": r["disposition_id"],
+            "item_id": r["item_id"],
+            "idempotency_key": r["idempotency_key"],
+            "kind": r["kind"],
+            "quantity": r["quantity"],
+            "labels_used": r["labels_used"],
+            "epoch": r["epoch"],
+            "operator": r["operator"],
+            "occurred_at": r["occurred_at"],
+            "reason": r["reason"],
+            "created_at": r["created_at"],
+        }
+
+    # --------------------------------------------------------------- 审核快照与状态
+    def set_relabel_candidate(self, disposition_id: str, new_label_id: str,
+                              new_print_batch_id: str) -> None:
+        self._exec(
+            "UPDATE relabel_dispositions SET new_label_id = ?,"
+            " new_print_batch_id = ? WHERE disposition_id = ?",
+            (new_label_id, new_print_batch_id, disposition_id))
+
+    def approve_relabel_review(self, disposition_id: str, reviewer: str,
+                               epoch: int, review: dict,
+                               ledger: list[dict]) -> None:
+        """审核通过：落审核快照（append-only）、抬升 epoch、预留新卷标、置 approved。
+
+        预留账（reserved）只增；上一轮在办失效时其未消耗预留先退回（returned），
+        由 :meth:`invalidate_relabel_disposition` 处理。
+        """
+        with self.transaction():
+            self._exec(
+                "INSERT INTO relabel_reviews (disposition_id, epoch, reviewer,"
+                " analysis_version, approved_copy_snapshot, print_copy_summary,"
+                " basis_derived, item_checks, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (disposition_id, epoch, reviewer, review["analysis_version"],
+                 json.dumps(review["approved_copy"], ensure_ascii=False),
+                 json.dumps(review["print_summary"], ensure_ascii=False),
+                 json.dumps(review["basis_derived"], ensure_ascii=False),
+                 json.dumps(review["item_checks"], ensure_ascii=False), utcnow()))
+            for entry in ledger:
+                self._exec(
+                    "INSERT INTO relabel_label_ledger (disposition_id, print_batch_id,"
+                    " kind, quantity, epoch, reason, created_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (disposition_id, entry["print_batch_id"], entry["kind"],
+                     entry["quantity"], epoch, entry.get("reason"), utcnow()))
+            self._exec(
+                "UPDATE relabel_dispositions SET status = 'approved',"
+                " current_epoch = ?, approved_by = ?, approved_at = ?,"
+                " invalidated_reason = NULL, invalidated_at = NULL"
+                " WHERE disposition_id = ?",
+                (epoch, reviewer, utcnow(), disposition_id))
+            self.log_event("relabel_review_approved", {
+                "disposition_id": disposition_id, "epoch": epoch,
+                "reviewer": reviewer, "analysis_version": review["analysis_version"],
+                "reserved": [e for e in ledger if e["kind"] == "reserved"]})
+
+    def relabel_reviews(self, disposition_id: str) -> list[dict]:
+        return [
+            {"id": r["id"], "disposition_id": r["disposition_id"],
+             "epoch": r["epoch"], "reviewer": r["reviewer"],
+             "analysis_version": r["analysis_version"],
+             "approved_copy_snapshot": _loads(r["approved_copy_snapshot"], {}),
+             "print_copy_summary": _loads(r["print_copy_summary"], {}),
+             "basis_derived": _loads(r["basis_derived"], {}),
+             "item_checks": _loads(r["item_checks"], []),
+             "created_at": r["created_at"]}
+            for r in self._q(
+                "SELECT * FROM relabel_reviews WHERE disposition_id = ? ORDER BY id",
+                (disposition_id,))
+        ]
+
+    def latest_relabel_review(self, disposition_id: str, epoch: int) -> dict | None:
+        r = self._one(
+            "SELECT * FROM relabel_reviews WHERE disposition_id = ? AND epoch = ?"
+            " ORDER BY id DESC LIMIT 1", (disposition_id, epoch))
+        if r is None:
+            return None
+        return {"id": r["id"], "epoch": r["epoch"], "reviewer": r["reviewer"],
+                "analysis_version": r["analysis_version"],
+                "approved_copy_snapshot": _loads(r["approved_copy_snapshot"], {}),
+                "print_copy_summary": _loads(r["print_copy_summary"], {}),
+                "basis_derived": _loads(r["basis_derived"], {}),
+                "item_checks": _loads(r["item_checks"], []),
+                "created_at": r["created_at"]}
+
+    def invalidate_relabel_disposition(self, disposition_id: str, reason: str,
+                                       print_batch_id: str, epoch: int,
+                                       outstanding_reserved: int) -> None:
+        """在办处置失效：置 invalidated，退回该轮未消耗的新卷标预留。
+
+        处置事件全部保留（带 epoch），待复核重审后按新一轮事件核平。
+        """
+        with self.transaction():
+            self._exec(
+                "UPDATE relabel_dispositions SET status = 'invalidated',"
+                " invalidated_reason = ?, invalidated_at = ?"
+                " WHERE disposition_id = ?",
+                (reason, utcnow(), disposition_id))
+            if outstanding_reserved > 0:
+                self._exec(
+                    "INSERT INTO relabel_label_ledger (disposition_id, print_batch_id,"
+                    " kind, quantity, epoch, reason, created_at)"
+                    " VALUES (?,?,'returned',?,?,?,?)",
+                    (disposition_id, print_batch_id, outstanding_reserved, epoch,
+                     reason, utcnow()))
+            self.log_event("relabel_disposition_invalidated", {
+                "disposition_id": disposition_id, "reason": reason,
+                "epoch": epoch, "returned_reserved": outstanding_reserved})
+
+    # --------------------------------------------------------------- 新卷标预留账
+    def _relabel_ledger_sum(self, print_batch_id: str, kind: str) -> int:
+        r = self._one(
+            "SELECT COALESCE(SUM(quantity),0) AS s FROM relabel_label_ledger"
+            " WHERE print_batch_id = ? AND kind = ?", (print_batch_id, kind))
+        return int(r["s"])
+
+    def reserved_quantity(self, print_batch_id: str) -> int:
+        return self._relabel_ledger_sum(print_batch_id, "reserved")
+
+    def reserved_consumed_quantity(self, print_batch_id: str) -> int:
+        return self._relabel_ledger_sum(print_batch_id, "consumed")
+
+    def reserved_returned_quantity(self, print_batch_id: str) -> int:
+        return self._relabel_ledger_sum(print_batch_id, "returned")
+
+    def relabel_label_ledger(self, disposition_id: str) -> list[dict]:
+        return [
+            {"id": r["id"], "print_batch_id": r["print_batch_id"],
+             "kind": r["kind"], "quantity": r["quantity"], "epoch": r["epoch"],
+             "reason": r["reason"], "created_at": r["created_at"]}
+            for r in self._q(
+                "SELECT * FROM relabel_label_ledger WHERE disposition_id = ?"
+                " ORDER BY id", (disposition_id,))
+        ]
+
+    # --------------------------------------------------------------- 结案（只读）
+    def close_relabel_disposition(self, disposition_id: str, epoch: int,
+                                  snapshot: dict, closed_by: str) -> dict:
+        closure_id = new_id("cls")
+        with self.transaction():
+            self._exec(
+                "INSERT INTO relabel_closures (closure_id, disposition_id, epoch,"
+                " snapshot, closed_by, created_at) VALUES (?,?,?,?,?,?)",
+                (closure_id, disposition_id, epoch,
+                 json.dumps(snapshot, ensure_ascii=False), closed_by, utcnow()))
+            self._exec(
+                "UPDATE relabel_dispositions SET status = 'closed'"
+                " WHERE disposition_id = ?", (disposition_id,))
+            rec = snapshot["reconciliation"]
+            self.log_event("relabel_disposition_closed", {
+                "closure_id": closure_id, "disposition_id": disposition_id,
+                "epoch": epoch, "closed_by": closed_by,
+                "isolated_units": rec["unit_balance"]["isolated_units"],
+                "relabelled_units": rec["unit_balance"]["relabelled_units"],
+                "scrapped_units": rec["unit_balance"]["scrapped_units"],
+                "still_quarantined_units":
+                    rec["unit_balance"]["still_quarantined_units"],
+                "labels_consumed":
+                    rec["label_balance"]["labels_consumed"]})
+        return self.get_relabel_closure(closure_id)
+
+    def get_relabel_closure(self, closure_id: str) -> dict | None:
+        r = self._one("SELECT * FROM relabel_closures WHERE closure_id = ?",
+                      (closure_id,))
+        return self._decode_relabel_closure(r) if r else None
+
+    def relabel_closures(self, disposition_id: str) -> list[dict]:
+        return [
+            self._decode_relabel_closure(r)
+            for r in self._q(
+                "SELECT * FROM relabel_closures WHERE disposition_id = ? ORDER BY id",
+                (disposition_id,))
+        ]
+
+    @staticmethod
+    def _decode_relabel_closure(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "closure_id": r["closure_id"],
+            "disposition_id": r["disposition_id"],
+            "epoch": r["epoch"],
+            "snapshot": _loads(r["snapshot"], {}),
+            "closed_by": r["closed_by"],
             "created_at": r["created_at"],
         }
