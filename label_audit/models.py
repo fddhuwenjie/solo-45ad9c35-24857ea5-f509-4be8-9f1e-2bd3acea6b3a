@@ -273,3 +273,77 @@ class AllocationReverse(BaseModel):
     """开工前撤销分配：记一笔反向流水恢复批号余量。"""
 
     reason: str = Field(min_length=1)
+
+
+# ------------------------------------------------------------- 包装执行与卷标结算
+class ClearanceFinding(BaseModel):
+    """清场发现：开工前对包装线现场的检查结果。
+
+    发现旧卷标且未隔离（isolated=false）时开工门禁拒绝；已隔离的发现
+    照实登记，留作核对包证据。
+    """
+
+    finding: str = Field(min_length=1, description="清场发现描述")
+    old_rolls_found: int = Field(default=0, ge=0, description="发现的旧卷标数量（卷）")
+    isolated: bool = Field(default=True, description="发现的旧卷标是否已隔离")
+    note: Optional[str] = Field(default=None, description="备注（如隔离区编号）")
+
+
+class PackagingRunCreate(BaseModel):
+    """包装运行开工登记：绑定生产批次、领用记录、包装线、计划产量与每件用标数。"""
+
+    run_id: str = Field(min_length=1)
+    production_batch_id: str = Field(min_length=1, description="待包装生产批次")
+    line_id: str = Field(min_length=1, description="包装线")
+    planned_quantity: int = Field(gt=0, description="计划产量（件）")
+    labels_per_unit: int = Field(ge=1, description="每件用标数")
+    issuance_ids: list[str] = Field(min_length=1,
+                                    description="本次上线使用的领用记录；"
+                                                "必须全部属于该生产批次且来自同一标签修订")
+    operator: str = Field(min_length=1, description="开工登记人")
+    clearance_findings: list[ClearanceFinding] = Field(
+        default_factory=list, description="开工清场发现；旧卷标未隔离时阻止开工")
+
+
+class PackagingEventCreate(BaseModel):
+    """用标事件：合格品贴用 / 过程损耗 / 留样 / 退回隔离（幂等，只增不改）。
+
+    applied 事件必须携带 good_units（合格品数），且
+    quantity == good_units × 每件用标数；其余类别不得携带 good_units。
+    """
+
+    kind: Literal["applied", "wasted", "sampled", "returned"]
+    quantity: int = Field(gt=0, description="本事件用标数量（枚）")
+    good_units: Optional[int] = Field(
+        default=None, ge=0, description="合格品数；仅 applied 事件必填")
+    operator: str = Field(min_length=1, description="操作者")
+    occurred_at: Optional[str] = Field(default=None,
+                                       description="发生时刻 ISO8601；缺省取服务器当前时刻")
+    reason: Optional[str] = Field(default=None, description="事由（如损耗原因）")
+    idempotency_key: str = Field(min_length=1,
+                                 description="幂等键；同键同内容重放复用原事件")
+
+
+class PackagingAdjustmentCreate(BaseModel):
+    """盘点更正调整事件：结算后记录不可覆盖，更正以有符号增量追加并重新判定。
+
+    delta 为类别合计的有符号增量；category=applied 时可用 good_units_delta
+    同步更正合格品数。调整不得使类别合计或合格品数为负。
+    """
+
+    category: Literal["applied", "wasted", "sampled", "returned"]
+    delta: int = Field(description="类别合计的有符号增量（不得与 good_units_delta 同时为 0）")
+    good_units_delta: int = Field(default=0,
+                                  description="合格品数有符号增量；仅 category=applied 有效")
+    reason: str = Field(min_length=1, description="盘点更正理由（必填）")
+    operator: str = Field(min_length=1, description="操作者")
+    occurred_at: Optional[str] = Field(default=None,
+                                       description="发生时刻 ISO8601；缺省取服务器当前时刻")
+    idempotency_key: str = Field(min_length=1,
+                                 description="幂等键；同键同内容重放复用原事件")
+
+
+class PackagingSettle(BaseModel):
+    """卷标结算：两条平衡等式同时满足才落结算记录。"""
+
+    settled_by: str = Field(min_length=1, description="结算人")

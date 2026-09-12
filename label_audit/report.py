@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 
-from . import genealogy, trace
+from . import genealogy, packaging, trace
 from .db import utcnow
 from .engine import analyze_label, expand_recipe
 
@@ -92,6 +92,16 @@ def build_check_package(store, label_id: str) -> dict:
             "dispositions": store.dispositions_for_print_batch(pb["print_batch_id"]),
         })
 
+    # 包装执行与卷标结算：串起清场发现、用标/调整事件与结算记录
+    packaging_runs = []
+    seen_runs = set()
+    for pb in store.print_batches_for_label(label_id):
+        for iss in store.issuances_for_print_batch(pb["print_batch_id"]):
+            run_id = store.issuance_bound_run(iss["issuance_id"])
+            if run_id and run_id not in seen_runs:
+                seen_runs.add(run_id)
+                packaging_runs.append(packaging.run_view(store, run_id))
+
     return {
         "package_type": "label_audit_check_package",
         "generated_at": utcnow(),
@@ -113,6 +123,11 @@ def build_check_package(store, label_id: str) -> dict:
             "total_disposed": sum(p["disposed_quantity"] for p in print_batches),
             "frozen": [p["print_batch_id"] for p in print_batches
                        if p["status"] == "frozen"],
+        },
+        "packaging_execution": {
+            "label_id": label_id,
+            "runs": packaging_runs,
+            "disposition": packaging.disposition_for_label(store, label_id),
         },
         "evidence_index": evidence_index,
     }
@@ -254,6 +269,63 @@ def build_review_sheet(store, label_id: str) -> str:
                    "<table><tr><th>时间</th><th>更正规格</th><th>声明差异</th></tr>"
                    f"{corr}</table>" if corrections else ""))
 
+    def packaging_section() -> str:
+        runs = []
+        seen = set()
+        for pb in store.print_batches_for_label(label_id):
+            for iss in store.issuances_for_print_batch(pb["print_batch_id"]):
+                rid = store.issuance_bound_run(iss["issuance_id"])
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    runs.append(packaging.run_view(store, rid))
+        if not runs:
+            return "<table><tr><td class='empty'>（无包装运行记录）</td></tr></table>"
+        out = ""
+        kind_names = {"applied": "合格品贴用", "wasted": "过程损耗",
+                      "sampled": "留样", "returned": "退回隔离",
+                      "adjustment": "盘点调整"}
+        for run in runs:
+            rec = run["reconciliation"]
+            clearance = "".join(
+                f"<tr><td>{_esc(f['finding'])}</td><td>{f['old_rolls_found']}</td>"
+                f"<td>{'已隔离' if f['isolated'] else '未隔离'}</td>"
+                f"<td>{_esc(f['note'] or '—')}</td></tr>"
+                for f in run["clearance_findings"])
+            clearance = (f"<table><tr><th>清场发现</th><th>旧卷标数</th><th>处置</th>"
+                         f"<th>备注</th></tr>{clearance}</table>" if clearance else "")
+            events = "".join(
+                f"<tr><td>{_esc(e['occurred_at'])}</td>"
+                f"<td>{_esc(kind_names.get(e['kind'], e['kind']))}"
+                f"{'（' + _esc(e['category']) + '）' if e['kind'] == 'adjustment' else ''}</td>"
+                f"<td>{e['quantity']}</td><td>{_esc(e['good_units'])}</td>"
+                f"<td>{_esc(e['operator'])}</td><td>{_esc(e['reason'] or '—')}</td></tr>"
+                for e in run["events"])
+            settlements = "".join(
+                f"<tr><td>{_esc(s['settlement_id'])}</td><td>{_esc(s['result'])}</td>"
+                f"<td>{_esc(s['settled_by'])}</td><td>{_esc(s['created_at'])}</td></tr>"
+                for s in run["settlements"])
+            ib = rec["balances"]["issuance_balance"]
+            ab = rec["balances"]["application_balance"]
+            out += (
+                f"<h3>包装运行 {_esc(run['run_id'])}（包装线 {_esc(run['line_id'])}，"
+                f"状态 {_esc(run['status'])}）</h3>"
+                f"<p>计划产量 {run['planned_quantity']} 件 × 每件用标 "
+                f"{run['labels_per_unit']} 枚；领用 {ib['issued_quantity']} 枚，"
+                f"贴用 {ab['applied_quantity']} 枚（合格品 {ab['good_units']} 件），"
+                f"损耗 {rec['sources']['wasted']['total']} 枚，"
+                f"留样 {rec['sources']['sampled']['total']} 枚，"
+                f"退回隔离 {rec['sources']['returned']['total']} 枚，"
+                f"线边未记账余量 {rec['on_line_remaining']} 枚；"
+                f"对账：{'平衡' if rec['balanced'] else '不平衡'}</p>"
+                + clearance
+                + (f"<table><tr><th>时刻</th><th>事件</th><th>数量</th>"
+                   f"<th>合格品数</th><th>操作者</th><th>事由</th></tr>{events}</table>"
+                   if events else "")
+                + (f"<table><tr><th>结算号</th><th>结果</th><th>结算人</th>"
+                   f"<th>结算时刻</th></tr>{settlements}</table>"
+                   if settlements else ""))
+        return out
+
     sheet = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>标签审查单 - {_esc(product['name'])} 第{label['revision']}版</title>
@@ -314,7 +386,10 @@ def build_review_sheet(store, label_id: str) -> str:
 <h2>八、投料谱系（锁定规格与扣量流水）</h2>
 {genealogy_section()}
 
-<h2>九、签字</h2>
+<h2>九、包装执行与卷标结算（清场 / 用标 / 调整 / 结算）</h2>
+{packaging_section()}
+
+<h2>十、签字</h2>
 <table class="sign"><tr><th>环节</th><th>签字</th><th>日期</th><th>备注</th></tr>
 {''.join(f"<tr><td>{s}</td><td></td><td></td><td></td></tr>" for s in ('草拟', '复核', '批准', '撤回'))}
 </table>

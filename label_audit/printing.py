@@ -22,6 +22,7 @@ import json
 
 from .db import new_id
 from .engine import BLOCKER, compare_with_copy, derive_declarations, expand_recipe, norm
+from .packaging import disposition_for_label
 from .trace import trace_findings
 
 # 重新分析时可能出现、但声明集合差异已经表达过的发现项；放行门禁不重复计列
@@ -189,7 +190,8 @@ def freeze_for_label(store, label_id: str, reason: str) -> dict:
     """影响传播：冻结标签修订下仍有余量的印刷批次，汇总已领用它们的生产批次。
 
     已全部领用（余量为 0）的批次无需冻结，但其领用记录仍出现在处置清单里——
-    已经贴到产品上的旧文案必须进入处置评估。
+    已经贴到产品上的旧文案必须进入处置评估。包装执行波及一并列出：未结算
+    现场余量（领出未上线 + 未结算运行的线边余量）、已包装数量与待隔离批次。
     """
     frozen = store.freeze_available_print_batches_for_label(label_id, reason)
     affected_batches: dict[str, dict] = {}
@@ -207,6 +209,11 @@ def freeze_for_label(store, label_id: str, reason: str) -> dict:
                 "issuance_id": iss["issuance_id"],
                 "analysis_version": iss["analysis_version"]})
             entry["issued_quantity"] += iss["quantity"]
+    packaging_disposition = disposition_for_label(store, label_id)
+    packaging_by_batch = {b["production_batch_id"]: b
+                          for b in packaging_disposition["batches"]}
+    for bid, entry in affected_batches.items():
+        entry["packaging"] = packaging_by_batch.get(bid)
     return {
         "label_id": label_id,
         "reason": reason,
@@ -218,4 +225,6 @@ def freeze_for_label(store, label_id: str, reason: str) -> dict:
             for pb in frozen],
         "disposition_batches": sorted(affected_batches.values(),
                                       key=lambda b: b["production_batch_id"]),
+        "pending_isolation_batches":
+            packaging_disposition["pending_isolation_batches"],
     }

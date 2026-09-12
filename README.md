@@ -10,6 +10,7 @@
 - **影响传播**：配方/规格更新沿依赖图标记受影响产品；拭子结果补录沿返工影响链标记批次标签；批准记录只读并派生新修订；
 - **投料谱系**：到货批号记录供应商批号、对应规格、收货量、有效期与待检/放行/隔离状态；为生产批次分配一个或多个批号及用量（未放行/已过期/余量不足/规格不符配方均拒绝，幂等键防重复扣量）；来源图按开工锁定的投料规格展开，用料缺项记证据空白；供应商更正沿扣料关系圈出涉事成品、标签与已发放卷标；开工前可撤销分配并记反向流水；
 - **印刷批次领用放行**：印刷卷标按批准修订入库（规范化文案摘要），领用时核对标签仍 approved、无 stale、产品匹配、未失效、余量充足，并把待包装批次当前分析与批准快照/印刷摘要逐项对照；撤回、规格变化、阳性拭子冻结剩余卷标并列出处置批次；
+- **包装执行与卷标结算**：开工绑定生产批次、领用记录、包装线、计划产量与每件用标数并登记清场发现（旧卷标未隔离、领用横跨不同标签修订、卷标已冻结、适用产品不符均阻止开工）；合格品贴用/过程损耗/留样/退回隔离以幂等事件追加并保留操作者与时刻；结算同时满足「领用量=贴用+损耗+留样+退回隔离」与「贴用量=合格品数×每件用标数」，差异返回数量来源，退回量不补回可领用余量；结算记录不可覆盖，盘点更正追加调整事件并重新判定；撤回/更正时列出未结算现场余量、已包装数量与待隔离批次；
 - **审核覆盖**：审核人可覆盖自动结论，但必须填写理由并关联输入证据；
 - **报告**：两版声明比较（增删 + 波及范围）、JSON 核对包、可打印审查单、请求样例。
 
@@ -19,7 +20,7 @@
 pip install -r requirements.txt
 uvicorn label_audit.main:app --reload          # 默认内存库
 # 持久化：LABEL_DB 未内置环境变量，使用 create_app("audit.db") 指定 SQLite 文件
-python -m pytest tests/                        # 端到端测试（59 + 14 个投料谱系测试）
+python -m pytest tests/                        # 端到端测试（95 个，含 22 个包装执行测试）
 ```
 
 交互文档：`http://localhost:8000/docs`。
@@ -35,6 +36,7 @@ python -m pytest tests/                        # 端到端测试（59 + 14 个�
 清洁记录/拭子定量(必检点) ─┤            ↑ 返工料去向（可跨产品、可传递）
 到货批号 ─> 投料分配(锁定规格/扣量流水) ─> 供应商更正沿扣料关系波及
 标签文案 ───────────────────────────────> 比对 ──> 批准/阻断
+印刷批次 ─> 领用放行(逐项对照) ─> 包装运行(清场/开工绑定) ─> 用标事件 ─> 卷标结算
 ```
 
 ## 逐批次追溯
@@ -138,6 +140,22 @@ swab:{swab_id}                                 拭子结果
 6. 每次放行记录冻结采用的标签修订、分析版本（当前推导结构含待包装批次所属产品的哈希 `ana-…`）、数量变化；核对包的 `print_control` 汇总入库/领用/处置数量、冻结原因与每条领用；审查单含印刷批次小节；事件日志记录 `print_batch_registered / issued / frozen / disposed`。
 7. stale 标记不可被“重新分析”清除：仅草稿/复核中标签能凭重新分析消解 stale；已批准/已撤回修订的 stale 只能保留——`/reanalyze`、`/analysis`、审查单生成（内部重跑分析）或新登记印刷批次都不能让它恢复可领用。
 
+## 包装执行与卷标结算
+
+包装线领出卷标后，系统不再只知道“数量去了哪个生产批次”：每一枚卷标的贴用、损耗、留样与退回都落成可审计事件，线边混入旧卷标时获批文案不再能贴错批。
+
+1. `POST /packaging-runs` 开工登记：绑定生产批次、领用记录（`issuance_ids`）、包装线、计划产量与每件用标数，并登记清场发现（`clearance_findings`）。门禁（任一不符整体 409 + `failures`，不登记任何记录）：
+   - 清场发现旧卷标未隔离（`old_rolls_not_isolated`）；
+   - 领用记录不存在（`issuance_unknown`）、属于其他生产批次（`issuance_batch_mismatch`）或已绑定其他运行（`issuance_already_bound`，防重复计量）；
+   - 领用横跨不同标签修订（`mixed_label_revisions`，同线混用是贴错批的典型来源）；
+   - 卷标已冻结（`print_batch_frozen`）或标签修订已撤回/带 stale 标记（`label_revision_blocked`）；
+   - 印刷批次适用产品不含待包装批次产品（`product_not_applicable`）。
+2. `POST /packaging-runs/{id}/events` 记录用标事件：`applied`（合格品贴用，须带 `good_units` 且满足 贴用量=合格品数×每件用标数）、`wasted`（过程损耗）、`sampled`（留样）、`returned`（退回隔离）；每条事件保留操作者与时刻，幂等键唯一（同键同内容重放复用、同键冲突 409）；事件只增不改。**退回隔离数量留在领用方账上，不补回印刷批次可领用余量。**
+3. `POST /packaging-runs/{id}/settle` 卷标结算：同时满足「领用量 = 贴用 + 损耗 + 留样 + 退回隔离」与「贴用量 = 合格品数 × 每件用标数」才落结算记录（append-only）并置 `settled`；不平衡时 409，`detail.reconciliation` 给出两条等式的差异与各数量来源（领用记录逐条、各类别的用标事件量与调整量分列）。`GET /packaging-runs/{id}/reconciliation` 提供不落记录的实时对账。
+4. **盘点更正**：结算后用标事件即封闭，记录不可覆盖；`POST /packaging-runs/{id}/adjustments` 以有符号增量追加调整事件（必须写明理由，不得使类别合计或合格品数为负），重新结算生成新的结算记录——历史结算快照永不改写。
+5. **撤回/更正波及**：标签撤回或供应商规格更正触发影响传播时，`print_freeze` 按生产批次列出未结算现场余量（领出未上线 + 未结算运行的线边余量）、已包装数量（贴用量与合格品数）与 `pending_isolation_batches` 待隔离批次；已平衡结算的运行现场余量清零，已包装成品仍进入处置评估。
+6. 审计串联：核对包 `packaging_execution` 汇总该标签修订下全部包装运行（清场发现、用标/调整事件、结算记录与实时对账）及波及清单；批次查询带 `packaging_runs`；审查单含包装执行小节；事件日志记录 `packaging_run_started / packaging_event_recorded / packaging_run_settled`。
+
 ## 主要接口
 
 | 方法 | 路径 | 说明 |
@@ -161,6 +179,9 @@ swab:{swab_id}                                 拭子结果
 | POST | `/labels/{id}/findings/{fid}/override` | 覆盖自动结论 |
 | POST | `/print-batches` · `/{id}/issue` · `/{id}/dispose` | 印刷批次入库（批准文案摘要）/ 领用放行（幂等，逐项对照）/ 冻结余量报废或隔离 |
 | GET | `/print-batches/{id}` | 印刷批次详情（领用与处置流水） |
+| POST | `/packaging-runs` · GET `/packaging-runs/{id}` | 包装运行开工登记（清场 + 门禁）/ 运行完整视图 |
+| POST | `/packaging-runs/{id}/events` · `/{id}/adjustments` | 用标事件（幂等，贴用/损耗/留样/退回隔离）/ 盘点更正调整 |
+| POST | `/packaging-runs/{id}/settle` · GET `/packaging-runs/{id}/reconciliation` | 卷标结算（双等式平衡）/ 实时对账 |
 | GET | `/labels/{id}/check-package` | JSON 核对包（含批次追溯证据索引与印刷放行控制） |
 | GET | `/labels/{id}/review-sheet` | 可打印审查单（HTML，含追溯小节） |
 | GET | `/samples/compound-coline` | 复合原料 + 共线冲突请求样例 |
@@ -179,6 +200,7 @@ label_audit/
   engine.py   规则引擎：展开、推导、检测、影响、比较
   trace.py    逐批次追溯：路径开闭、返工链、批准快照证据
   printing.py 印刷批次：文案规范化摘要、放行逐项对照、影响冻结
+  packaging.py 包装执行：开工门禁、幂等用标事件、双等式结算、盘点更正、撤回波及清单
   genealogy.py 投料谱系：分配门禁、锁定规格、更正波及链、反向流水
   db.py       SQLite 持久层（approvals 只读）
   report.py   JSON 核对包 / 可打印审查单

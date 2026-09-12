@@ -223,6 +223,59 @@ CREATE TABLE IF NOT EXISTS lot_ledger (
     reason TEXT,
     created_at TEXT NOT NULL
 );
+-- 包装执行与卷标结算：包装运行、领用绑定、清场发现、用标事件与结算记录
+CREATE TABLE IF NOT EXISTS packaging_runs (
+    run_id TEXT PRIMARY KEY,
+    production_batch_id TEXT NOT NULL,
+    line_id TEXT NOT NULL,
+    planned_quantity INTEGER NOT NULL,
+    labels_per_unit INTEGER NOT NULL,
+    expected_label_quantity INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packaging_run_issuances (
+    run_id TEXT NOT NULL,
+    issuance_id TEXT NOT NULL,
+    print_batch_id TEXT NOT NULL,
+    label_id TEXT NOT NULL,
+    label_revision INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    PRIMARY KEY (run_id, issuance_id)
+);
+CREATE TABLE IF NOT EXISTS clearance_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    finding TEXT NOT NULL,
+    old_rolls_found INTEGER NOT NULL DEFAULT 0,
+    isolated INTEGER NOT NULL DEFAULT 1,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packaging_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    category TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    good_units INTEGER,
+    operator TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS packaging_settlements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    settlement_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    settled_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 # 标签生命周期：draft -> in_review -> approved -> withdrawn
@@ -235,6 +288,14 @@ LOT_STATUSES = ("pending", "released", "quarantined")
 # 投料分配状态：active 有效 -> reversed 已撤销（仅开工前，记反向流水）
 ALLOCATION_STATUSES = ("active", "reversed")
 LEDGER_KINDS = ("allocate", "reverse")
+# 包装运行状态：open 进行中 -> settled 已结算（结算后仅接受盘点调整事件）
+PACKAGING_RUN_STATUSES = ("open", "settled")
+# 用标事件：applied 合格品贴用 / wasted 过程损耗 / sampled 留样 / returned 退回隔离；
+# adjustment 盘点调整（结算后追加更正，category 指向调整对象，quantity 为有符号增量）
+PACKAGING_EVENT_KINDS = ("applied", "wasted", "sampled", "returned", "adjustment")
+PACKAGING_CATEGORIES = ("applied", "wasted", "sampled", "returned")
+# 结算结果：balanced 平衡（不平衡时不落结算记录，仅返回差异与数量来源）
+SETTLEMENT_RESULTS = ("balanced",)
 
 
 def utcnow() -> str:
@@ -1217,5 +1278,206 @@ class Store:
             "kind": r["kind"],
             "quantity": r["quantity"],
             "reason": r["reason"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 包装运行
+    def create_packaging_run(self, run_id: str, batch_id: str, line_id: str,
+                             planned_quantity: int, labels_per_unit: int,
+                             issuances: list[dict], operator: str,
+                             clearance_findings: list[dict]) -> dict:
+        """开工登记：绑定生产批次、领用记录、包装线、计划产量与每件用标数，
+        并登记清场发现。issuances 为门禁通过后的领用记录快照。"""
+        self._exec(
+            "INSERT INTO packaging_runs (run_id, production_batch_id, line_id,"
+            " planned_quantity, labels_per_unit, expected_label_quantity, status,"
+            " created_by, created_at) VALUES (?,?,?,?,?,?,'open',?,?)",
+            (run_id, batch_id, line_id, planned_quantity, labels_per_unit,
+             planned_quantity * labels_per_unit, operator, utcnow()),
+        )
+        for iss in issuances:
+            self._exec(
+                "INSERT INTO packaging_run_issuances (run_id, issuance_id,"
+                " print_batch_id, label_id, label_revision, quantity)"
+                " VALUES (?,?,?,?,?,?)",
+                (run_id, iss["issuance_id"], iss["print_batch_id"],
+                 iss["label_id"], iss["label_revision"], iss["quantity"]),
+            )
+        for f in clearance_findings:
+            self._exec(
+                "INSERT INTO clearance_findings (run_id, finding, old_rolls_found,"
+                " isolated, note, created_at) VALUES (?,?,?,?,?,?)",
+                (run_id, f["finding"], f.get("old_rolls_found", 0),
+                 int(f.get("isolated", True)), f.get("note"), utcnow()),
+            )
+        self.log_event("packaging_run_started", {
+            "run_id": run_id, "production_batch_id": batch_id, "line_id": line_id,
+            "planned_quantity": planned_quantity, "labels_per_unit": labels_per_unit,
+            "expected_label_quantity": planned_quantity * labels_per_unit,
+            "issuances": [{"issuance_id": i["issuance_id"],
+                           "print_batch_id": i["print_batch_id"],
+                           "label_id": i["label_id"],
+                           "label_revision": i["label_revision"],
+                           "quantity": i["quantity"]} for i in issuances],
+            "clearance_findings": clearance_findings,
+            "operator": operator})
+        return self.get_packaging_run(run_id)
+
+    def get_packaging_run(self, run_id: str) -> dict | None:
+        r = self._one("SELECT * FROM packaging_runs WHERE run_id = ?", (run_id,))
+        return self._decode_packaging_run(r) if r else None
+
+    def runs_for_batch(self, batch_id: str) -> list[dict]:
+        return [
+            self._decode_packaging_run(r)
+            for r in self._q(
+                "SELECT * FROM packaging_runs WHERE production_batch_id = ?"
+                " ORDER BY rowid", (batch_id,))
+        ]
+
+    def issuance_bound_run(self, issuance_id: str) -> str | None:
+        """领用记录已绑定的包装运行 ID；未绑定返回 None（领出未上线）。"""
+        r = self._one(
+            "SELECT run_id FROM packaging_run_issuances WHERE issuance_id = ?",
+            (issuance_id,))
+        return r["run_id"] if r else None
+
+    def set_packaging_run_status(self, run_id: str, status: str) -> None:
+        assert status in PACKAGING_RUN_STATUSES
+        self._exec("UPDATE packaging_runs SET status = ? WHERE run_id = ?",
+                   (status, run_id))
+
+    def _decode_packaging_run(self, r: sqlite3.Row) -> dict:
+        run_id = r["run_id"]
+        return {
+            "run_id": run_id,
+            "production_batch_id": r["production_batch_id"],
+            "line_id": r["line_id"],
+            "planned_quantity": r["planned_quantity"],
+            "labels_per_unit": r["labels_per_unit"],
+            "expected_label_quantity": r["expected_label_quantity"],
+            "status": r["status"],
+            "created_by": r["created_by"],
+            "created_at": r["created_at"],
+            "issuances": [
+                {"issuance_id": i["issuance_id"],
+                 "print_batch_id": i["print_batch_id"],
+                 "label_id": i["label_id"],
+                 "label_revision": i["label_revision"],
+                 "quantity": i["quantity"]}
+                for i in self._q(
+                    "SELECT issuance_id, print_batch_id, label_id, label_revision,"
+                    " quantity FROM packaging_run_issuances WHERE run_id = ?"
+                    " ORDER BY rowid", (run_id,))],
+            "clearance_findings": [
+                {"id": f["id"], "finding": f["finding"],
+                 "old_rolls_found": f["old_rolls_found"],
+                 "isolated": bool(f["isolated"]), "note": f["note"],
+                 "created_at": f["created_at"]}
+                for f in self._q(
+                    "SELECT * FROM clearance_findings WHERE run_id = ? ORDER BY id",
+                    (run_id,))],
+        }
+
+    # ------------------------------------------------------------------ 用标事件（只增不改）
+    def create_packaging_event(self, event_id: str, run_id: str,
+                               idempotency_key: str, kind: str, category: str,
+                               quantity: int, good_units: int | None,
+                               operator: str, occurred_at: str | None,
+                               reason: str | None) -> dict:
+        assert kind in PACKAGING_EVENT_KINDS
+        assert category in PACKAGING_CATEGORIES
+        occurred = occurred_at or utcnow()
+        self._exec(
+            "INSERT INTO packaging_events (event_id, run_id, idempotency_key, kind,"
+            " category, quantity, good_units, operator, occurred_at, reason,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, run_id, idempotency_key, kind, category, quantity,
+             good_units, operator, occurred, reason, utcnow()),
+        )
+        self.log_event("packaging_event_recorded", {
+            "event_id": event_id, "run_id": run_id, "kind": kind,
+            "category": category, "quantity": quantity, "good_units": good_units,
+            "operator": operator, "occurred_at": occurred, "reason": reason,
+            "idempotency_key": idempotency_key})
+        return self.get_packaging_event(event_id)
+
+    def get_packaging_event(self, event_id: str) -> dict | None:
+        r = self._one("SELECT * FROM packaging_events WHERE event_id = ?",
+                      (event_id,))
+        return self._decode_packaging_event(r) if r else None
+
+    def packaging_event_by_key(self, idempotency_key: str) -> dict | None:
+        r = self._one("SELECT * FROM packaging_events WHERE idempotency_key = ?",
+                      (idempotency_key,))
+        return self._decode_packaging_event(r) if r else None
+
+    def events_for_run(self, run_id: str) -> list[dict]:
+        return [
+            self._decode_packaging_event(r)
+            for r in self._q(
+                "SELECT * FROM packaging_events WHERE run_id = ? ORDER BY id",
+                (run_id,))
+        ]
+
+    @staticmethod
+    def _decode_packaging_event(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "event_id": r["event_id"],
+            "run_id": r["run_id"],
+            "idempotency_key": r["idempotency_key"],
+            "kind": r["kind"],
+            "category": r["category"],
+            "quantity": r["quantity"],
+            "good_units": r["good_units"],
+            "operator": r["operator"],
+            "occurred_at": r["occurred_at"],
+            "reason": r["reason"],
+            "created_at": r["created_at"],
+        }
+
+    # ------------------------------------------------------------------ 结算记录（只增不改）
+    def add_settlement(self, run_id: str, result: str, snapshot: dict,
+                       settled_by: str) -> dict:
+        """追加一条结算记录；历史结算永不改写，盘点更正后重新结算即追加新记录。"""
+        assert result in SETTLEMENT_RESULTS
+        settlement_id = new_id("stl")
+        self._exec(
+            "INSERT INTO packaging_settlements (settlement_id, run_id, result,"
+            " snapshot, settled_by, created_at) VALUES (?,?,?,?,?,?)",
+            (settlement_id, run_id, result,
+             json.dumps(snapshot, ensure_ascii=False), settled_by, utcnow()),
+        )
+        self.log_event("packaging_run_settled", {
+            "settlement_id": settlement_id, "run_id": run_id, "result": result,
+            "settled_by": settled_by,
+            "issued_quantity": snapshot["balances"]["issuance_balance"]["issued_quantity"],
+            "applied_quantity": snapshot["balances"]["application_balance"]["applied_quantity"],
+            "good_units": snapshot["balances"]["application_balance"]["good_units"]})
+        return self.get_settlement(settlement_id)
+
+    def get_settlement(self, settlement_id: str) -> dict | None:
+        r = self._one("SELECT * FROM packaging_settlements WHERE settlement_id = ?",
+                      (settlement_id,))
+        return self._decode_settlement(r) if r else None
+
+    def settlements_for_run(self, run_id: str) -> list[dict]:
+        return [
+            self._decode_settlement(r)
+            for r in self._q(
+                "SELECT * FROM packaging_settlements WHERE run_id = ? ORDER BY id",
+                (run_id,))
+        ]
+
+    @staticmethod
+    def _decode_settlement(r: sqlite3.Row) -> dict:
+        return {
+            "id": r["id"],
+            "settlement_id": r["settlement_id"],
+            "run_id": r["run_id"],
+            "result": r["result"],
+            "snapshot": _loads(r["snapshot"], {}),
+            "settled_by": r["settled_by"],
             "created_at": r["created_at"],
         }

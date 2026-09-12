@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
-from . import __version__, engine, genealogy, printing, report, trace
+from . import __version__, engine, genealogy, packaging, printing, report, trace
 from .db import Store, utcnow
 from .models import (
     AllocationCreate,
@@ -24,6 +24,10 @@ from .models import (
     LotStatusUpdate,
     MaterialLotCreate,
     OverrideRequest,
+    PackagingAdjustmentCreate,
+    PackagingEventCreate,
+    PackagingRunCreate,
+    PackagingSettle,
     PrintBatchCreate,
     PrintBatchDispose,
     PrintBatchIssue,
@@ -175,7 +179,13 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                 "rework_in": store.rework_into(batch_id),
                 "rework_out": store.rework_from(batch_id),
                 "allocations": store.allocations_for_batch(batch_id),
-                "lot_ledger": store.ledger_for_batch(batch_id)}
+                "lot_ledger": store.ledger_for_batch(batch_id),
+                "packaging_runs": [
+                    {"run_id": r["run_id"], "line_id": r["line_id"],
+                     "status": r["status"], "planned_quantity": r["planned_quantity"],
+                     "labels_per_unit": r["labels_per_unit"],
+                     "issued_quantity": sum(i["quantity"] for i in r["issuances"])}
+                    for r in store.runs_for_batch(batch_id)]}
 
     @app.get("/batches/{batch_id}/trace", tags=["批次追溯"])
     def batch_trace(batch_id: str, store: Store = Depends(get_store)):
@@ -727,6 +737,164 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
             store, [allocation["batch_id"]], positive=False,
             reason=f"撤销投料分配 {allocation_id}：{body.reason}")
         return {**result, "actions": actions}
+
+    # ------------------------------------------------------------- 包装执行与卷标结算
+    def _run_or_404(run_id: str, store: Store) -> dict:
+        run = store.get_packaging_run(run_id)
+        if run is None:
+            raise HTTPException(404, f"包装运行 {run_id} 不存在")
+        return run
+
+    @app.post("/packaging-runs", status_code=201, tags=["包装执行"])
+    def start_packaging_run(body: PackagingRunCreate, store: Store = Depends(get_store)):
+        """开工登记：绑定生产批次、领用记录、包装线、计划产量与每件用标数，
+        并登记清场发现。
+
+        门禁（all-or-nothing，任一不符不登记任何记录）：清场发现旧卷标未隔离；
+        领用记录不存在 / 属于其他批次 / 已绑定其他运行；领用横跨不同标签修订；
+        卷标已冻结或标签修订已撤回 / 带 stale 标记；印刷批次适用产品不含
+        待包装批次产品。
+        """
+        batch = store.get_batch(body.production_batch_id)
+        if batch is None:
+            raise HTTPException(404, f"生产批次 {body.production_batch_id} 不存在")
+        if store.get_line(body.line_id) is None:
+            raise HTTPException(404, f"包装线 {body.line_id} 不存在")
+        outcome = packaging.start_run(
+            store, body.run_id, batch, body.line_id, body.planned_quantity,
+            body.labels_per_unit, body.issuance_ids, body.operator,
+            [f.model_dump() for f in body.clearance_findings])
+        if outcome["outcome"] == "conflict":
+            raise HTTPException(409, f"包装运行 {body.run_id} 已存在")
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "开工门禁未通过，未登记包装运行",
+                      "failures": outcome["failures"]})
+        return packaging.run_view(store, body.run_id)
+
+    @app.get("/packaging-runs/{run_id}", tags=["包装执行"])
+    def get_packaging_run(run_id: str, store: Store = Depends(get_store)):
+        """运行完整视图：绑定、清场发现、用标/调整事件、结算记录与实时对账。"""
+        _run_or_404(run_id, store)
+        return packaging.run_view(store, run_id)
+
+    @app.get("/packaging-runs/{run_id}/reconciliation", tags=["包装执行"])
+    def run_reconciliation(run_id: str, store: Store = Depends(get_store)):
+        """实时对账（不落结算记录）：两条平衡等式与各数量来源拆分。"""
+        run = _run_or_404(run_id, store)
+        return packaging.reconciliation(store, run)
+
+    @app.post("/packaging-runs/{run_id}/events", tags=["包装执行"])
+    def record_packaging_event(run_id: str, body: PackagingEventCreate,
+                               response: Response, store: Store = Depends(get_store)):
+        """记录用标事件（合格品贴用/过程损耗/留样/退回隔离），保留操作者与时刻。
+
+        幂等键唯一：同键同内容重放复用原事件（200），同键内容冲突 409。
+        已结算运行不再接受用标事件，仅接受盘点调整。退回隔离数量留在领用方
+        账上，不补回印刷批次可领用余量。
+        """
+        run = _run_or_404(run_id, store)
+        if run["status"] != "open":
+            raise HTTPException(
+                409, {"error": f"包装运行已结算（状态 {run['status']}），"
+                               f"不再接受用标事件；盘点更正请使用调整事件",
+                      "run_status": run["status"]})
+        if body.kind == "applied":
+            if body.good_units is None:
+                raise HTTPException(422, "合格品贴用事件必须给出合格品数 good_units")
+            expected = body.good_units * run["labels_per_unit"]
+            if body.quantity != expected:
+                raise HTTPException(
+                    422, {"error": "贴用量与合格品数×每件用标数不符",
+                          "quantity": body.quantity,
+                          "good_units": body.good_units,
+                          "labels_per_unit": run["labels_per_unit"],
+                          "expected_quantity": expected})
+        elif body.good_units is not None:
+            raise HTTPException(422, "仅合格品贴用事件可携带合格品数 good_units")
+        outcome = packaging.record_event(
+            store, run, body.idempotency_key, body.kind, body.quantity,
+            body.good_units, body.operator, body.occurred_at, body.reason)
+        if outcome["outcome"] == "conflict":
+            prior = outcome["prior"]
+            raise HTTPException(
+                409, {"error": "幂等键重复但事件内容不一致，已记录事件不可改写",
+                      "idempotency_key": body.idempotency_key,
+                      "original": {"run_id": prior["run_id"], "kind": prior["kind"],
+                                   "quantity": prior["quantity"],
+                                   "good_units": prior["good_units"],
+                                   "operator": prior["operator"]},
+                      "conflicting": {"run_id": run_id, "kind": body.kind,
+                                      "quantity": body.quantity,
+                                      "good_units": body.good_units,
+                                      "operator": body.operator}})
+        if outcome["outcome"] == "reused":
+            response.status_code = 200
+            return {"event": outcome["event"], "reused": True}
+        response.status_code = 201
+        return {"event": outcome["event"], "reused": False}
+
+    @app.post("/packaging-runs/{run_id}/adjustments", tags=["包装执行"])
+    def record_packaging_adjustment(run_id: str, body: PackagingAdjustmentCreate,
+                                    response: Response,
+                                    store: Store = Depends(get_store)):
+        """盘点更正调整事件：结算后记录不可覆盖，更正以有符号增量追加。
+
+        调整必须写明理由；不得使类别合计或合格品数为负。追加后重新结算
+        即按最新合计重新判定，历史结算记录保持不可覆盖。
+        """
+        run = _run_or_404(run_id, store)
+        if body.delta == 0 and body.good_units_delta == 0:
+            raise HTTPException(422, "delta 与 good_units_delta 不得同时为 0")
+        if body.category != "applied" and body.good_units_delta != 0:
+            raise HTTPException(422, "仅 category=applied 的调整可携带合格品数增量")
+        outcome = packaging.record_adjustment(
+            store, run, body.idempotency_key, body.category, body.delta,
+            body.good_units_delta, body.reason, body.operator, body.occurred_at)
+        if outcome["outcome"] == "conflict":
+            prior = outcome["prior"]
+            raise HTTPException(
+                409, {"error": "幂等键重复但调整内容不一致，已记录事件不可改写",
+                      "idempotency_key": body.idempotency_key,
+                      "original": {"run_id": prior["run_id"],
+                                   "category": prior["category"],
+                                   "quantity": prior["quantity"],
+                                   "good_units": prior["good_units"],
+                                   "operator": prior["operator"]},
+                      "conflicting": {"run_id": run_id, "category": body.category,
+                                      "delta": body.delta,
+                                      "good_units_delta": body.good_units_delta,
+                                      "operator": body.operator}})
+        if outcome["outcome"] == "failed":
+            raise HTTPException(
+                409, {"error": "调整未通过门禁，未记录",
+                      "failures": outcome["failures"]})
+        if outcome["outcome"] == "reused":
+            response.status_code = 200
+            return {"event": outcome["event"], "reused": True}
+        response.status_code = 201
+        return {"event": outcome["event"], "reused": False}
+
+    @app.post("/packaging-runs/{run_id}/settle", tags=["包装执行"])
+    def settle_packaging_run(run_id: str, body: PackagingSettle,
+                             store: Store = Depends(get_store)):
+        """卷标结算：两条平衡等式同时满足才落结算记录（append-only）。
+
+          领用量 = 贴用量 + 损耗量 + 留样量 + 退回隔离量
+          贴用量 = 合格品数 × 每件用标数
+
+        不平衡时 409 并返回各数量来源（领用记录、用标事件与调整事件分列）；
+        盘点更正追加调整事件后重新结算，生成新的结算记录，历史记录不可覆盖。
+        """
+        _run_or_404(run_id, store)
+        outcome = packaging.settle(store, run_id, body.settled_by)
+        if outcome["outcome"] == "discrepancy":
+            raise HTTPException(
+                409, {"error": "结算不平衡：领用量/贴用量与账面记录存在差异",
+                      "reconciliation": outcome["reconciliation"]})
+        return {"settlement": outcome["settlement"],
+                "reconciliation": outcome["reconciliation"],
+                "run": packaging.run_view(store, run_id)}
 
     # ------------------------------------------------------------- 报告
     @app.get("/labels/{label_id}/check-package", tags=["报告"])

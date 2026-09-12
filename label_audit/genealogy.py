@@ -225,7 +225,7 @@ def correction_impact(store, ingredient_id: str, new_version: str,
     受影响，也不得判为未受影响。
     """
     lots = store.lots_for_ingredient(ingredient_id)
-    reason = f"供应商更正 {ingredient_id} 过敏原声明（新规格 {ingredient_id}@{new_version}）"
+    reason = f"供应商更正 {ingredient_id} 过敏原声明（新规格版本 {ingredient_id}@{new_version}）"
 
     # 本次被更正的旧规格：显式指定，缺省取登记前最新版本
     if corrects_version is not None:
