@@ -438,6 +438,118 @@ def test_adjustment_allowed_on_open_run_for_miscount(client):
         "total": 20, "usage_quantity": 30, "adjustment_quantity": -10}
 
 
+def test_adjustment_unsettles_run_then_withdraw(client):
+    """先平衡结算、再经调整变为不平衡、随后撤回：
+
+    调整写入后按最新事件账重新判定——运行回退 open，波及清单按实时对账
+    列出现场余量与待隔离批次；历史结算快照保持不可覆盖。
+    """
+    lid = setup_world(client)
+    register_print_batch(client, lid)
+    iss = issue(client, "PB1", "iss-1", qty=200)
+    assert start_run(client, [iss]).status_code == 201
+    balanced_events(client)
+    assert client.post("/packaging-runs/RUN1/settle",
+                       json={"settled_by": "qa.li"}).status_code == 200
+    assert client.get("/packaging-runs/RUN1").json()["status"] == "settled"
+    # 盘点更正：退回隔离多记 2 枚 → 实时对账出现 2 枚线边余量
+    res = post_adjustment(client, "RUN1", "adj-1", "returned", -2,
+                          reason="盘点：退回多记 2 枚")
+    assert res.status_code == 201
+    assert res.json()["run_status"] == "open"  # 不再平衡，不得继续按 settled 处理
+    run = client.get("/packaging-runs/RUN1").json()
+    assert run["status"] == "open"
+    assert run["reconciliation"]["balanced"] is False
+    assert run["reconciliation"]["on_line_remaining"] == 2
+    # 历史结算快照不可覆盖
+    assert len(run["settlements"]) == 1
+    snap = run["settlements"][0]["snapshot"]
+    assert snap["balances"]["issuance_balance"]["accounted_quantity"] == 200
+    assert snap["balances"]["issuance_balance"]["balanced"] is True
+    # 重新判定写入事件日志
+    reopened = [e for e in client.get("/events").json()
+                if e["kind"] == "packaging_run_reopened"]
+    assert len(reopened) == 1
+    assert reopened[0]["payload"]["run_id"] == "RUN1"
+    # 再次结算返回 discrepancy（差异 2 枚）
+    res = client.post("/packaging-runs/RUN1/settle", json={"settled_by": "qa.li"})
+    assert res.status_code == 409
+    ib = res.json()["detail"]["reconciliation"]["balances"]["issuance_balance"]
+    assert ib["balanced"] is False and ib["difference"] == 2
+    # 撤回：波及清单按实时对账列出 2 枚现场余量与待隔离批次
+    res = client.post(f"/labels/{lid}/withdraw", json={"reason": "文案勘误"})
+    assert res.status_code == 200
+    freeze = res.json()["print_freeze"]
+    assert freeze["pending_isolation_batches"] == ["B2"]
+    pack = freeze["disposition_batches"][0]["packaging"]
+    assert pack["unsettled_on_line_quantity"] == 2
+    assert pack["packed_quantity"] == 160
+    assert pack["pending_isolation"] is True
+    run_info = pack["runs"][0]
+    assert run_info["status"] == "open"
+    assert run_info["on_line_remaining"] == 2
+    assert run_info["currently_balanced"] is False
+
+
+def test_adjustment_unsettles_then_rebalance_and_resettle(client):
+    """回退 open 后补记调整恢复平衡，可再次结算；两条结算记录均不可覆盖。"""
+    started_run(client)
+    balanced_events(client)
+    assert client.post("/packaging-runs/RUN1/settle",
+                       json={"settled_by": "qa.li"}).status_code == 200
+    # 调整打破平衡 → open；再补一笔恢复平衡
+    assert post_adjustment(client, "RUN1", "adj-1", "returned", -2,
+                           reason="盘点：退回多记 2 枚").status_code == 201
+    assert client.get("/packaging-runs/RUN1").json()["status"] == "open"
+    res = post_adjustment(client, "RUN1", "adj-2", "wasted", 2,
+                          reason="盘点：漏记损耗 2 枚")
+    assert res.status_code == 201
+    assert res.json()["run_status"] == "open"  # 重新判定只在结算时回升 settled
+    assert client.get("/packaging-runs/RUN1").json()[
+        "reconciliation"]["balanced"] is True
+    # 再次结算成功：状态回升 settled，生成第二条结算记录
+    assert client.post("/packaging-runs/RUN1/settle",
+                       json={"settled_by": "qa.li"}).status_code == 200
+    run = client.get("/packaging-runs/RUN1").json()
+    assert run["status"] == "settled"
+    assert len(run["settlements"]) == 2
+    first, second = run["settlements"]
+    assert first["settlement_id"] != second["settlement_id"]
+    # 首条快照保持结算当时的数据（退回 10），第二条反映调整后（退回 8、损耗 22）
+    assert first["snapshot"]["sources"]["returned"]["total"] == 10
+    assert first["snapshot"]["sources"]["wasted"]["total"] == 20
+    assert second["snapshot"]["sources"]["returned"] == {
+        "total": 8, "usage_quantity": 10, "adjustment_quantity": -2}
+    assert second["snapshot"]["sources"]["wasted"] == {
+        "total": 22, "usage_quantity": 20, "adjustment_quantity": 2}
+
+
+def test_settled_restored_only_by_resettle(client):
+    """单笔调整打破任一等式即回退 open；只有重新结算成功才回升 settled。"""
+    started_run(client)
+    balanced_events(client)
+    assert client.post("/packaging-runs/RUN1/settle",
+                       json={"settled_by": "qa.li"}).status_code == 200
+    # 贴用 -2（合格品 -1）：贴用等式仍平衡，但领用等式被打破（198 ≠ 200）
+    res = post_adjustment(client, "RUN1", "adj-1", "applied", -2,
+                          units_delta=-1, reason="盘点：2 枚贴用实为损耗")
+    assert res.status_code == 201
+    assert res.json()["run_status"] == "open"
+    # 再补损耗 +2 恢复平衡：状态仍为 open，settled 只能由重新结算授予
+    assert post_adjustment(client, "RUN1", "adj-2", "wasted", 2,
+                           reason="盘点：2 枚贴用实为损耗").status_code == 201
+    run = client.get("/packaging-runs/RUN1").json()
+    assert run["status"] == "open"
+    assert run["reconciliation"]["balanced"] is True
+    # 回退只记一次日志（已 open 的运行不重复记）
+    reopened = [e for e in client.get("/events").json()
+                if e["kind"] == "packaging_run_reopened"]
+    assert len(reopened) == 1
+    assert client.post("/packaging-runs/RUN1/settle",
+                       json={"settled_by": "qa.li"}).status_code == 200
+    assert client.get("/packaging-runs/RUN1").json()["status"] == "settled"
+
+
 # -------------------------------------------------------------- 撤回 / 更正波及清单
 
 def test_withdraw_lists_packaging_disposition(client):

@@ -840,8 +840,10 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                                     store: Store = Depends(get_store)):
         """盘点更正调整事件：结算后记录不可覆盖，更正以有符号增量追加。
 
-        调整必须写明理由；不得使类别合计或合格品数为负。追加后重新结算
-        即按最新合计重新判定，历史结算记录保持不可覆盖。
+        调整必须写明理由；不得使类别合计或合格品数为负。写入后按最新事件账
+        重新判定：两条结算等式不再成立时运行回退为 open（响应 run_status
+        可见），不得继续按 settled 处理；重新结算生成新的结算记录，历史
+        结算快照保持不可覆盖。
         """
         run = _run_or_404(run_id, store)
         if body.delta == 0 and body.good_units_delta == 0:
@@ -871,9 +873,11 @@ def create_app(db_path: str = ":memory:") -> FastAPI:
                       "failures": outcome["failures"]})
         if outcome["outcome"] == "reused":
             response.status_code = 200
-            return {"event": outcome["event"], "reused": True}
+            return {"event": outcome["event"], "reused": True,
+                    "run_status": outcome["run_status"]}
         response.status_code = 201
-        return {"event": outcome["event"], "reused": False}
+        return {"event": outcome["event"], "reused": False,
+                "run_status": outcome["run_status"]}
 
     @app.post("/packaging-runs/{run_id}/settle", tags=["包装执行"])
     def settle_packaging_run(run_id: str, body: PackagingSettle,

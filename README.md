@@ -152,9 +152,9 @@ swab:{swab_id}                                 拭子结果
    - 印刷批次适用产品不含待包装批次产品（`product_not_applicable`）。
 2. `POST /packaging-runs/{id}/events` 记录用标事件：`applied`（合格品贴用，须带 `good_units` 且满足 贴用量=合格品数×每件用标数）、`wasted`（过程损耗）、`sampled`（留样）、`returned`（退回隔离）；每条事件保留操作者与时刻，幂等键唯一（同键同内容重放复用、同键冲突 409）；事件只增不改。**退回隔离数量留在领用方账上，不补回印刷批次可领用余量。**
 3. `POST /packaging-runs/{id}/settle` 卷标结算：同时满足「领用量 = 贴用 + 损耗 + 留样 + 退回隔离」与「贴用量 = 合格品数 × 每件用标数」才落结算记录（append-only）并置 `settled`；不平衡时 409，`detail.reconciliation` 给出两条等式的差异与各数量来源（领用记录逐条、各类别的用标事件量与调整量分列）。`GET /packaging-runs/{id}/reconciliation` 提供不落记录的实时对账。
-4. **盘点更正**：结算后用标事件即封闭，记录不可覆盖；`POST /packaging-runs/{id}/adjustments` 以有符号增量追加调整事件（必须写明理由，不得使类别合计或合格品数为负），重新结算生成新的结算记录——历史结算快照永不改写。
-5. **撤回/更正波及**：标签撤回或供应商规格更正触发影响传播时，`print_freeze` 按生产批次列出未结算现场余量（领出未上线 + 未结算运行的线边余量）、已包装数量（贴用量与合格品数）与 `pending_isolation_batches` 待隔离批次；已平衡结算的运行现场余量清零，已包装成品仍进入处置评估。
-6. 审计串联：核对包 `packaging_execution` 汇总该标签修订下全部包装运行（清场发现、用标/调整事件、结算记录与实时对账）及波及清单；批次查询带 `packaging_runs`；审查单含包装执行小节；事件日志记录 `packaging_run_started / packaging_event_recorded / packaging_run_settled`。
+4. **盘点更正**：结算后用标事件即封闭，记录不可覆盖；`POST /packaging-runs/{id}/adjustments` 以有符号增量追加调整事件（必须写明理由，不得使类别合计或合格品数为负）。**调整事件写入后按最新事件账重新判定**：两条结算等式不再成立时运行回退为 `open`（事件日志记 `packaging_run_reopened`），不得继续按 `settled` 处理；恢复平衡后需重新结算才回升 `settled`——重新结算生成新的结算记录，历史结算快照永不改写。
+5. **撤回/更正波及**：标签撤回或供应商规格更正触发影响传播时，`print_freeze` 按生产批次列出未结算现场余量（领出未上线 + 未结算运行的线边余量，**按实时对账判定**——仅当前仍满足两条结算等式的已结算运行才视为现场余量清零）、已包装数量（贴用量与合格品数）与 `pending_isolation_batches` 待隔离批次；已包装成品始终进入处置评估。
+6. 审计串联：核对包 `packaging_execution` 汇总该标签修订下全部包装运行（清场发现、用标/调整事件、结算记录与实时对账）及波及清单；批次查询带 `packaging_runs`；审查单含包装执行小节；事件日志记录 `packaging_run_started / packaging_event_recorded / packaging_run_settled / packaging_run_reopened`。
 
 ## 主要接口
 

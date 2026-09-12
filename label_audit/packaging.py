@@ -12,9 +12,11 @@
   返回（领用来自哪些领用记录、各类别来自多少条用标事件与调整事件）；
   退回隔离数量留在领用方账上，不补回印刷批次可领用余量；
 - 盘点更正：结算后记录不可覆盖，更正以 adjustment 调整事件（有符号增量，
-  必须写明理由）追加，重新结算生成新的结算记录——结算记录同样只增不改；
-- 波及清单：标签撤回 / 规格更正时，按生产批次列出未结算现场余量、
-  已包装数量与待隔离批次，供处置评估。
+  必须写明理由）追加；调整写入后按最新事件账重新判定——两条结算等式不再
+  成立时运行回退为 open，不得继续按 settled 处理；重新结算生成新的结算
+  记录，历史结算快照保持不可覆盖；
+- 波及清单：标签撤回 / 规格更正时，按生产批次列出未结算现场余量（按实时
+  对账判定，而非缓存状态）、已包装数量与待隔离批次，供处置评估。
 """
 from __future__ import annotations
 
@@ -282,12 +284,35 @@ def record_event(store, run: dict, idempotency_key: str, kind: str,
         return {"outcome": "created", "event": event}
 
 
+def _rejudge_settled_run(store, run_id: str, trigger_event: dict) -> dict:
+    """调整事件写入后按最新事件账重新判定运行状态。
+
+    已结算运行因盘点调整不再满足两条结算等式时，回退为 open——不得继续按
+    settled 处理；历史结算快照保持不可覆盖（append-only，不回写）。
+    重新平衡后可再次结算，生成新的结算记录。
+    """
+    run = store.get_packaging_run(run_id)
+    if run["status"] != "settled":
+        return run
+    rec = reconciliation(store, run)
+    if rec["balanced"]:
+        return run
+    store.set_packaging_run_status(run_id, "open")
+    store.log_event("packaging_run_reopened", {
+        "run_id": run_id,
+        "trigger_event_id": trigger_event["event_id"],
+        "reason": "盘点调整后两条结算等式不再成立，运行回退为 open 重新判定",
+        "balances": rec["balances"]})
+    return store.get_packaging_run(run_id)
+
+
 def record_adjustment(store, run: dict, idempotency_key: str, category: str,
                       delta: int, good_units_delta: int, reason: str,
                       operator: str, occurred_at: str | None) -> dict:
     """盘点更正调整事件（幂等）：有符号增量追加，不覆盖既有记录。
 
-    调整不得使任一类别合计或合格品数为负；结算后重新结算即按新合计判定。
+    调整不得使任一类别合计或合格品数为负；写入后按最新事件账重新判定
+    运行状态（见 :func:`_rejudge_settled_run`）。
     """
     content = _event_content(run["run_id"], "adjustment", category, delta,
                              good_units_delta if category == "applied" else None,
@@ -297,7 +322,8 @@ def record_adjustment(store, run: dict, idempotency_key: str, category: str,
         if prior is not None:
             if _stored_content(prior) != content:
                 return {"outcome": "conflict", "prior": prior}
-            return {"outcome": "reused", "event": prior}
+            return {"outcome": "reused", "event": prior,
+                    "run_status": store.get_packaging_run(run["run_id"])["status"]}
         t = run_totals(store, run["run_id"])
         failures = []
         if t["totals"][category] + delta < 0:
@@ -318,7 +344,8 @@ def record_adjustment(store, run: dict, idempotency_key: str, category: str,
             new_id("pev"), run["run_id"], idempotency_key, "adjustment", category,
             delta, good_units_delta if category == "applied" else None,
             operator, occurred_at, reason)
-        return {"outcome": "created", "event": event}
+        run = _rejudge_settled_run(store, run["run_id"], event)
+        return {"outcome": "created", "event": event, "run_status": run["status"]}
 
 
 # ---------------------------------------------------------------------- 结算
@@ -347,8 +374,10 @@ def disposition_for_label(store, label_id: str) -> dict:
     """标签撤回 / 规格更正时的包装执行波及清单。
 
     按生产批次列出：未结算现场余量（领出未上线 + 未结算运行的线边余量）、
-    已包装数量（贴用量与合格品数）与待隔离批次。已平衡结算的运行现场余量
-    为零，不计入未结算现场余量。
+    已包装数量（贴用量与合格品数）与待隔离批次。是否计入现场余量按**实时
+    对账**判定而非缓存状态：只有当前仍满足两条结算等式的已结算运行才视为
+    现场余量清零；结算后被盘点调整打破平衡的运行（已回退 open）按实际
+    线边余量计入。
     """
     per_batch: dict[str, dict] = {}
     bound_runs: dict[str, str] = {}  # run_id -> production_batch_id
@@ -373,6 +402,11 @@ def disposition_for_label(store, label_id: str) -> dict:
         t = run_totals(store, run_id)
         issued = sum(i["quantity"] for i in run["issuances"])
         accounted = sum(t["totals"][c] for c in PACKAGING_CATEGORIES)
+        on_line = issued - accounted
+        # 实时对账：两条结算等式当前是否同时成立
+        balanced = (on_line == 0
+                    and t["totals"]["applied"]
+                    == t["good_units"] * run["labels_per_unit"])
         per_batch[bid]["runs"].append({
             "run_id": run_id,
             "status": run["status"],
@@ -382,7 +416,8 @@ def disposition_for_label(store, label_id: str) -> dict:
             "wasted_quantity": t["totals"]["wasted"],
             "sampled_quantity": t["totals"]["sampled"],
             "returned_quantity": t["totals"]["returned"],
-            "on_line_remaining": issued - accounted,
+            "on_line_remaining": on_line,
+            "currently_balanced": balanced,
         })
 
     batches = []
@@ -390,7 +425,8 @@ def disposition_for_label(store, label_id: str) -> dict:
     for bid in sorted(per_batch):
         entry = per_batch[bid]
         unsettled_on_line = entry["unbound_quantity"] + sum(
-            r["on_line_remaining"] for r in entry["runs"] if r["status"] != "settled")
+            r["on_line_remaining"] for r in entry["runs"]
+            if not (r["status"] == "settled" and r["currently_balanced"]))
         packed_quantity = sum(r["applied_quantity"] for r in entry["runs"])
         packed_units = sum(r["good_units"] for r in entry["runs"])
         pending = unsettled_on_line > 0 or packed_quantity > 0
